@@ -1,0 +1,83 @@
+[workspace]
+
+members = [
+    "crates/crypto",
+    "crates/signer",
+    "crates/transport",
+    "crates/graphql",
+    "crates/storage",
+    "crates/sdk-core",
+    "crates/config",
+    "crates/sdk",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/polarityorg/sparksdk"
+authors = ["Flashnet <can@flashnet.xyz>"]
+
+[workspace.dependencies]
+# Crypto
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+bech32 = { version = "0.11", default-features = false }
+bitcoin = { version = "0.32.8", default-features = false, features = [
+    "serde",
+    "rand",
+] }
+frost-core = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing" }
+frost-secp256k1-tr = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing" }
+rand_core = { version = "0.6", default-features = false }
+spark-crypto = { path = "crates/crypto" }
+k256 = { version = "0.13.4", default-features = false, features = [
+    "arithmetic",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Signing
+signer = { path = "crates/signer", default-features = false }
+
+# SDK
+sdk-core = { path = "crates/sdk-core" }
+
+# gRPC / serialization
+bytes = "1"
+tonic = { version = "0.14.3", features = [
+    "tls-ring",
+    "tls-native-roots",
+    "gzip",
+] }
+tonic-prost = "0.14.3"
+tonic-prost-build = "0.14.3"
+tonic-build = "0.14.3"
+tonic-reflection = "0.14.3"
+prost = "0.14.3"
+prost-types = "0.14.3"
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.test]
+debug = true
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+debug = 0
+
+# Install cargo-run-script to make use of these scripts
+[workspace.metadata.scripts]
+unit-test = "./scripts/tests/1-run-unit-tests.sh"
+integration-test = "./scripts/tests/2-run-integration-tests.sh"
+leaf-selector-test = "./scripts/tests/3-run-leaf-selector-tests.sh"
+spark-module-test = "./scripts/tests/4-run-spark-module-tests.sh"

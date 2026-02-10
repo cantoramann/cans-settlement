@@ -1,0 +1,27 @@
+[net]
+git-fetch-with-cli = true
+
+[registry]
+default = "polarity"
+global-credential-providers = ["cargo:token"]
+
+[registries.polarity]
+index = "sparse+https://polarity.jfrog.io/artifactory/api/cargo/polarity-cargo-local/index/"
+
+[alias]
+docs = "doc --workspace --all-features --no-deps"
+docsd = "doc --workspace --all --all-features --no-deps --document-private-items --open"
+coveragetd = "tarpaulin --all-features --workspace --timeout 120"
+coverageld = "llvm-cov --workspace --cobertura --output-path ./cobertura.xml"
+clippy-clean = "!./scripts/clippy.sh"
+
+# These point to cargo-run-script scripts in Cargo.toml
+# in workspace.metadata.scripts section.
+# (Install with cargo install cargo-run-script)
+unit-test = "run-script unit-test"
+integration-test = "run-script integration-test"
+leaf-selector-test = "run-script leaf-selector-test"
+spark-module-test = "run-script spark-module-test"
+
+# Funding server aliases
+build-funding-server = ""

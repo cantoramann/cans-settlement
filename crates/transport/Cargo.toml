@@ -1,0 +1,35 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport layer for Spark SDK (gRPC, Tower middleware)"
+
+[lib]
+doctest = false # Proto comments contain math that looks like code blocks
+
+[dependencies]
+# Signing (trait-only, no transitive crypto deps)
+signer = { workspace = true, optional = true }
+
+# gRPC (optional, default enabled)
+bytes = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+bitcoin = { workspace = true }
+signer = { path = "../signer" }
+rand = "0.8"
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
+[features]
+default = ["grpc"]
+grpc = ["dep:signer", "dep:bytes", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build"]
+mock = []

@@ -1,0 +1,19 @@
+[package]
+name = "spark-crypto"
+edition = "2024"
+version = "0.1.0"
+
+[features]
+
+[dependencies]
+aes-gcm = { workspace = true }
+bitcoin = { workspace = true }
+frost-secp256k1-tr = { workspace = true }
+k256 = { workspace = true }
+rand_core = { workspace = true }
+
+[dev-dependencies]
+ecies_ext = { package = "ecies", version = "0.2" }
+rand = "0.8"
+
+[lints]
