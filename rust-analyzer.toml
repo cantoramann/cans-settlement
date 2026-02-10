@@ -1,0 +1,4 @@
+# Enable build script execution so rust-analyzer can resolve OUT_DIR
+# for generated proto code in the transport crate.
+[cargo]
+buildScripts.enable = true

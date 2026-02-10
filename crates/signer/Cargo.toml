@@ -1,0 +1,23 @@
+[package]
+name = "signer"
+publish = ["polarity"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Signing abstractions and implementations for Spark protocol"
+
+[dependencies]
+bitcoin = { workspace = true, optional = true }
+spark-crypto = { workspace = true, optional = true }
+frost-secp256k1-tr = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+
+[features]
+default = ["spark"]
+spark = ["dep:bitcoin", "dep:spark-crypto", "dep:frost-secp256k1-tr", "dep:rand_core"]
