@@ -53,6 +53,7 @@
 pub mod bitcoin_tx;
 pub mod error;
 pub mod frost_bridge;
+pub mod network;
 pub mod operations;
 pub mod token;
 pub mod tree;
