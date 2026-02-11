@@ -18,7 +18,6 @@ mod verify_decrypt;
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bytes::Bytes;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use signer::WalletSigner;
 use transport::{common, spark};
 
@@ -239,8 +238,9 @@ where
                     .proofs
                     .iter()
                     .map(|p| {
-                        let point = p.to_encoded_point(true);
-                        Bytes::copy_from_slice(point.as_bytes())
+                        Bytes::copy_from_slice(
+                            &spark_crypto::verifiable_secret_sharing::serialize_proof_point(p),
+                        )
                     })
                     .collect();
 
@@ -392,7 +392,7 @@ where
                 .map_err(|_| SdkError::SigningFailed)?;
             let cpfp_job = spark::SigningJob {
                 signing_public_key: pk_bytes.clone(),
-                raw_tx: Bytes::copy_from_slice(&serialize_tx(&cpfp_refund_tx)),
+                raw_tx: Bytes::from(serialize_tx(&cpfp_refund_tx)),
                 signing_nonce_commitment: Some(cpfp_commitment),
             };
 
@@ -402,7 +402,7 @@ where
                     commitment_to_proto(&dnp.commitment).map_err(|_| SdkError::SigningFailed)?;
                 Some(spark::SigningJob {
                     signing_public_key: pk_bytes.clone(),
-                    raw_tx: Bytes::copy_from_slice(&serialize_tx(dtx)),
+                    raw_tx: Bytes::from(serialize_tx(dtx)),
                     signing_nonce_commitment: Some(dc),
                 })
             } else {
@@ -414,7 +414,7 @@ where
                     .map_err(|_| SdkError::SigningFailed)?;
             let direct_from_cpfp_job = spark::SigningJob {
                 signing_public_key: pk_bytes,
-                raw_tx: Bytes::copy_from_slice(&serialize_tx(&direct_from_cpfp_refund_tx)),
+                raw_tx: Bytes::from(serialize_tx(&direct_from_cpfp_refund_tx)),
                 signing_nonce_commitment: Some(direct_from_cpfp_commitment),
             };
 
@@ -478,8 +478,8 @@ where
                 &ctx.direct_nonce_pair,
                 &ctx.direct_prev_out,
             ) {
-                let sig = self
-                    .frost_sign_and_aggregate(
+                Bytes::from(
+                    self.frost_sign_and_aggregate(
                         ctx,
                         dtx,
                         dpo,
@@ -488,8 +488,8 @@ where
                         &signing_result.verifying_key,
                         signer,
                     )
-                    .await?;
-                Bytes::copy_from_slice(&sig)
+                    .await?,
+                )
             } else {
                 Bytes::new()
             };
@@ -497,8 +497,8 @@ where
             let direct_from_cpfp_sig = if let Some(ref result) =
                 signing_result.direct_from_cpfp_refund_tx_signing_result
             {
-                let sig = self
-                    .frost_sign_and_aggregate(
+                Bytes::from(
+                    self.frost_sign_and_aggregate(
                         ctx,
                         &ctx.direct_from_cpfp_refund_tx,
                         &ctx.prev_out,
@@ -507,8 +507,8 @@ where
                         &signing_result.verifying_key,
                         signer,
                     )
-                    .await?;
-                Bytes::copy_from_slice(&sig)
+                    .await?,
+                )
             } else {
                 Bytes::new()
             };
@@ -516,7 +516,7 @@ where
             node_signatures.push(spark::NodeSignatures {
                 node_id: ctx.leaf_id.clone(),
                 node_tx_signature: Bytes::new(),
-                refund_tx_signature: Bytes::copy_from_slice(&cpfp_refund_sig),
+                refund_tx_signature: Bytes::from(cpfp_refund_sig),
                 direct_node_tx_signature: Bytes::new(),
                 direct_refund_tx_signature: direct_refund_sig,
                 direct_from_cpfp_refund_tx_signature: direct_from_cpfp_sig,

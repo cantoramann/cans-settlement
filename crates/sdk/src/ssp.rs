@@ -200,16 +200,18 @@ impl GraphqlSspClient {
     }
 
     /// Send a GraphQL POST and return the response body as a string.
+    ///
+    /// Takes `body_json` by value to avoid re-allocating the request string.
     async fn graphql_post(
         &self,
         client: &hyper_util::client::legacy::Client<
             hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
             http_body_util::Full<hyper::body::Bytes>,
         >,
-        body_json: &str,
+        body_json: String,
         auth_token: Option<&str>,
     ) -> Result<String, SdkError> {
-        let body = hyper::body::Bytes::from(body_json.to_owned());
+        let body = hyper::body::Bytes::from(body_json);
 
         let mut builder = hyper::Request::builder()
             .method(hyper::Method::POST)
@@ -268,9 +270,7 @@ impl SspClient for GraphqlSspClient {
         );
         tracing::debug!(identity_pubkey_hex, "SSP get_challenge");
 
-        let resp_str = self
-            .graphql_post(&client, &get_challenge_body, None)
-            .await?;
+        let resp_str = self.graphql_post(&client, get_challenge_body, None).await?;
 
         // Extract protected_challenge from JSON response.
         let protected_challenge = extract_json_string_field(&resp_str, "protected_challenge")
@@ -306,8 +306,8 @@ impl SspClient for GraphqlSspClient {
             protected_challenge, signature_b64, identity_pubkey_hex,
         );
 
-        tracing::debug!(body = verify_body, "SSP verify_challenge request");
-        let verify_resp = self.graphql_post(&client, &verify_body, None).await?;
+        tracing::debug!(body = %verify_body, "SSP verify_challenge request");
+        let verify_resp = self.graphql_post(&client, verify_body, None).await?;
         tracing::debug!(response = verify_resp, "SSP verify_challenge response");
 
         let session_token =
@@ -357,10 +357,10 @@ impl SspClient for GraphqlSspClient {
             variables,
         );
 
-        tracing::debug!(body = query, "SSP request_swap request");
+        tracing::debug!(body = %query, "SSP request_swap request");
 
         let body_str = self
-            .graphql_post(&client, &query, Some(&input.auth_token))
+            .graphql_post(&client, query, Some(&input.auth_token))
             .await?;
 
         tracing::debug!(response = body_str, "SSP request_swap response");
@@ -436,31 +436,34 @@ fn extract_json_string_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 // ---------------------------------------------------------------------------
 
 /// Decode a base64url string (without padding) into bytes.
+///
+/// Performs the URL-safe -> standard base64 translation and padding
+/// in a single stack-allocated buffer to avoid intermediate `String`s.
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    // Add padding if needed.
-    let padded = match input.len() % 4 {
-        2 => format!("{input}=="),
-        3 => format!("{input}="),
-        0 => input.to_owned(),
+    let pad = match input.len() % 4 {
+        0 => 0u8,
+        2 => 2,
+        3 => 1,
         _ => return None,
     };
 
-    // Translate URL-safe chars to standard base64.
-    let standard: String = padded
-        .chars()
-        .map(|c| match c {
-            '-' => '+',
-            '_' => '/',
+    // Translate URL-safe chars to standard base64 in a single Vec<u8>.
+    let mut buf = Vec::with_capacity(input.len() + pad as usize);
+    for &b in input.as_bytes() {
+        buf.push(match b {
+            b'-' => b'+',
+            b'_' => b'/',
             other => other,
-        })
-        .collect();
+        });
+    }
+    // Pad to 4-byte boundary (0–2 '=' chars).
+    buf.resize(buf.len() + pad as usize, b'=');
 
-    // Decode using a simple base64 decoder.
-    base64_decode_standard(&standard)
+    base64_decode_standard_bytes(&buf)
 }
 
-/// Standard base64 decode (RFC 4648).
-fn base64_decode_standard(input: &str) -> Option<Vec<u8>> {
+/// Standard base64 decode (RFC 4648) from raw bytes.
+fn base64_decode_standard_bytes(input: &[u8]) -> Option<Vec<u8>> {
     const TABLE: [u8; 128] = {
         let mut t = [0xFFu8; 128];
         let mut i = 0u8;
@@ -479,13 +482,12 @@ fn base64_decode_standard(input: &str) -> Option<Vec<u8>> {
         t
     };
 
-    let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if input.len() % 4 != 0 {
         return None;
     }
 
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks_exact(4) {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.chunks_exact(4) {
         let mut vals = [0u8; 4];
         let mut pad_count = 0u8;
         for (i, &b) in chunk.iter().enumerate() {

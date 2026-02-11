@@ -167,6 +167,16 @@ pub fn scalar_to_bytes(scalar: &Scalar) -> [u8; 32] {
     scalar.to_bytes().into()
 }
 
+/// Serializes a VSS proof point (k256 `PublicKey`) to 33-byte compressed SEC1 format.
+pub fn serialize_proof_point(point: &PublicKey) -> [u8; 33] {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let encoded = point.to_encoded_point(true);
+    let bytes = encoded.as_bytes();
+    let mut out = [0u8; 33];
+    out.copy_from_slice(bytes);
+    out
+}
+
 /// Derives the public key (point on the curve) for a given scalar.
 fn scalar_to_pubkey(secret: &Scalar) -> PublicKey {
     let point = ProjectivePoint::GENERATOR * *secret;

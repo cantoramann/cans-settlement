@@ -115,6 +115,7 @@ where
                 },
                 signer,
                 &mut rng,
+                &secp,
             )?;
             leaf_contexts.push(ctx);
         }
@@ -124,7 +125,7 @@ where
         let node_ids: Vec<String> = leaf_contexts.iter().map(|c| c.leaf_id.clone()).collect();
         let commitments_resp = authed
             .get_signing_commitments(spark::GetSigningCommitmentsRequest {
-                node_ids: node_ids.clone(),
+                node_ids,
                 count: 1,
                 ..Default::default()
             })

@@ -142,9 +142,9 @@ where
                 .proofs
                 .iter()
                 .map(|p| {
-                    use k256::elliptic_curve::sec1::ToEncodedPoint;
-                    let encoded = p.to_encoded_point(true);
-                    Bytes::copy_from_slice(encoded.as_bytes())
+                    Bytes::copy_from_slice(
+                        &spark_crypto::verifiable_secret_sharing::serialize_proof_point(p),
+                    )
                 })
                 .collect();
 

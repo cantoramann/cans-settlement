@@ -14,7 +14,6 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bytes::Bytes;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use signer::WalletSigner;
 use transport::spark;
 
@@ -92,13 +91,15 @@ pub(crate) struct BuildLeafParams<'a> {
 /// Generates an ephemeral keypair, computes the key tweak, VSS-splits it,
 /// builds per-operator tweak data, constructs the CPFP refund tx, and
 /// generates a FROST nonce pair.
+///
+/// The `secp` context should be created once per operation and shared
+/// across all leaf iterations to avoid repeated ~200 KB allocations.
 pub(crate) fn build_leaf_context(
     params: &BuildLeafParams<'_>,
     signer: &impl WalletSigner,
     rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
 ) -> Result<LeafTransferContext, SdkError> {
-    let secp = Secp256k1::new();
-
     let (current_sk, current_pk) = signer
         .derive_signing_keypair(params.leaf_id)
         .map_err(|_| SdkError::SigningFailed)?;
@@ -107,7 +108,7 @@ pub(crate) fn build_leaf_context(
     let mut eph_bytes = [0u8; 32];
     rand_core::RngCore::fill_bytes(rng, &mut eph_bytes);
     let ephemeral_sk = SecretKey::from_slice(&eph_bytes).expect("32 random bytes always valid");
-    let ephemeral_pk = PublicKey::from_secret_key(&secp, &ephemeral_sk);
+    let ephemeral_pk = PublicKey::from_secret_key(secp, &ephemeral_sk);
 
     // Compute key tweak: current - ephemeral.
     let key_tweak = signer
@@ -130,7 +131,7 @@ pub(crate) fn build_leaf_context(
         let share_bytes =
             spark_crypto::verifiable_secret_sharing::scalar_to_bytes(&share.secret_share.share);
         let share_sk = SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
-        let share_pk = PublicKey::from_secret_key(&secp, &share_sk);
+        let share_pk = PublicKey::from_secret_key(secp, &share_sk);
         pubkey_shares_tweak.insert(
             params.operator_ids[i].clone(),
             Bytes::copy_from_slice(&share_pk.serialize()),
@@ -146,8 +147,9 @@ pub(crate) fn build_leaf_context(
             .proofs
             .iter()
             .map(|p| {
-                let point = p.to_encoded_point(true);
-                Bytes::copy_from_slice(point.as_bytes())
+                Bytes::copy_from_slice(
+                    &spark_crypto::verifiable_secret_sharing::serialize_proof_point(p),
+                )
             })
             .collect();
         per_operator_tweaks.push(PerOperatorTweak {
@@ -327,12 +329,14 @@ pub(crate) fn build_key_tweak_package(
     let transfer_id_bytes = transfer_id.as_bytes();
     let mut key_tweak_package: HashMap<String, Bytes> = HashMap::new();
 
+    let mut sig_payload = Vec::with_capacity(256);
+
     for (op_idx, op) in operators.iter().enumerate() {
         let mut tweak_list: Vec<spark::SendLeafKeyTweak> = Vec::with_capacity(leaf_contexts.len());
 
         for ctx in leaf_contexts {
             // ECDSA signature: SHA256(leaf_id || transfer_id || secret_cipher).
-            let mut sig_payload = Vec::new();
+            sig_payload.clear();
             sig_payload.extend_from_slice(ctx.leaf_id.as_bytes());
             sig_payload.extend_from_slice(transfer_id_bytes);
             sig_payload.extend_from_slice(&ctx.secret_cipher);
@@ -388,7 +392,7 @@ pub(crate) fn sign_transfer_package(
     let transfer_id_raw = hex_decode(&transfer_id_hex).ok_or(SdkError::InvalidRequest)?;
 
     let mut pairs: Vec<(&String, &Bytes)> = key_tweak_package.iter().collect();
-    pairs.sort_by_key(|(k, _)| (*k).clone());
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut package_payload = transfer_id_raw;
     for (key, value) in pairs {
@@ -418,7 +422,7 @@ pub(crate) fn build_cpfp_signing_job(
     spark::UserSignedTxSigningJob {
         leaf_id: ctx.leaf_id.clone(),
         signing_public_key: pk_bytes,
-        raw_tx: Bytes::copy_from_slice(&serialize_tx(&ctx.cpfp_refund_tx)),
+        raw_tx: Bytes::from(serialize_tx(&ctx.cpfp_refund_tx)),
         signing_nonce_commitment: Some(user_commitment),
         user_signature: Bytes::copy_from_slice(user_sig_bytes),
         signing_commitments: Some(spark::SigningCommitments {

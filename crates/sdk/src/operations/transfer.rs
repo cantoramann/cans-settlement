@@ -210,6 +210,7 @@ where
         signer: &impl WalletSigner,
         network: bitcoin::Network,
     ) -> Result<SendTransferResult, SdkError> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
         let num_operators = self.inner.config.network.num_operators();
         let threshold = self.inner.config.network.threshold;
         let operators = self.inner.config.network.operators();
@@ -240,6 +241,7 @@ where
                 },
                 signer,
                 &mut rng,
+                &secp,
             )?;
 
             // Build direct refund txs (transfer-specific, not needed for swaps).
@@ -313,7 +315,7 @@ where
         let node_ids: Vec<String> = leaf_contexts.iter().map(|c| c.leaf_id.clone()).collect();
         let commitments_resp = authed
             .get_signing_commitments(spark::GetSigningCommitmentsRequest {
-                node_ids: node_ids.clone(),
+                node_ids,
                 count: 3,
                 ..Default::default()
             })
@@ -367,9 +369,9 @@ where
                 direct_jobs.push(spark::UserSignedTxSigningJob {
                     leaf_id: ctx.leaf_id.clone(),
                     signing_public_key: pk_bytes,
-                    raw_tx: Bytes::copy_from_slice(&serialize_tx(dtx)),
+                    raw_tx: Bytes::from(serialize_tx(dtx)),
                     signing_nonce_commitment: Some(direct_user_commitment),
-                    user_signature: Bytes::copy_from_slice(&direct_sig),
+                    user_signature: Bytes::from(direct_sig),
                     signing_commitments: Some(spark::SigningCommitments {
                         signing_commitments: direct_op_commitments
                             .signing_nonce_commitments
@@ -400,9 +402,9 @@ where
             direct_from_cpfp_jobs.push(spark::UserSignedTxSigningJob {
                 leaf_id: ctx.leaf_id.clone(),
                 signing_public_key: pk_bytes,
-                raw_tx: Bytes::copy_from_slice(&serialize_tx(&dd.direct_from_cpfp_refund_tx)),
+                raw_tx: Bytes::from(serialize_tx(&dd.direct_from_cpfp_refund_tx)),
                 signing_nonce_commitment: Some(dfcpfp_user_commitment),
-                user_signature: Bytes::copy_from_slice(&dfcpfp_sig),
+                user_signature: Bytes::from(dfcpfp_sig),
                 signing_commitments: Some(spark::SigningCommitments {
                     signing_commitments: dfcpfp_op_commitments.signing_nonce_commitments.clone(),
                 }),
