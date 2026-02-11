@@ -53,7 +53,15 @@ use crate::{Sdk, SdkError};
 /// Response from a send transfer operation.
 pub struct SendTransferResult {
     /// The transfer proto returned by the coordinator.
+    ///
+    /// `None` when an SSP swap was performed (the caller must claim the
+    /// swap's inbound transfer first, then re-send).
     pub transfer: Option<spark::Transfer>,
+
+    /// If an SSP swap was triggered to handle change, this contains the
+    /// inbound transfer ID that the caller must claim to receive the
+    /// exact-denomination leaves from the SSP.
+    pub ssp_swap_inbound_transfer_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,11 +114,12 @@ struct PerOperatorTweak {
 // Sdk::send_transfer
 // ---------------------------------------------------------------------------
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Send BTC to a receiver via a Spark transfer.
     ///
@@ -118,6 +127,11 @@ where
     /// key rotation from sender's current key to a randomly generated
     /// ephemeral key, with the ephemeral private key ECIES-encrypted
     /// for the receiver.
+    ///
+    /// If the selected leaves exceed the requested amount, an SSP swap
+    /// is performed first to produce exact-denomination leaves.  The
+    /// swap returns change to the sender's wallet as an inbound transfer
+    /// that must be claimed separately.
     pub async fn send_transfer(
         &self,
         sender_pubkey: &IdentityPubKey,
@@ -138,8 +152,37 @@ where
 
         // 1. Select and reserve leaves.
         let available = self.inner.tree_store.get_available_leaves()?;
-        let (selected, _total) =
+        let (selected, total) =
             select_leaves_greedy(&available, amount_sats).ok_or(SdkError::InsufficientBalance)?;
+
+        let change = total - amount_sats;
+
+        // 2. If there's change, perform an SSP swap first.
+        //    The SSP swap splits the selected leaves into exact denominations:
+        //    one leaf for `amount_sats` (to send) and one for `change` (returned
+        //    to the sender as an inbound transfer to claim).
+        if change > 0 {
+            let fee = crate::ssp::SSP_SWAP_FEE_SATS;
+            let target_amounts = vec![amount_sats, change.saturating_sub(fee)];
+
+            let swap_result = self
+                .ssp_swap(sender_pubkey, &selected, &target_amounts, signer)
+                .await?;
+
+            // The SSP sends new leaves back as an inbound transfer.
+            // The caller must claim the transfer (via `claim_transfer`) to
+            // obtain the exact-denomination leaves.  For now, we return
+            // the swap result info in the response and don't proceed with
+            // the second transfer -- the caller should claim, then re-call
+            // send_transfer with the exact leaf.
+            //
+            // TODO: Once claim is wired up inline, chain the claim + send
+            //       automatically so the user doesn't need two round-trips.
+            return Ok(SendTransferResult {
+                transfer: None,
+                ssp_swap_inbound_transfer_id: Some(swap_result.inbound_transfer_id),
+            });
+        }
 
         let leaf_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
         let reservation = self.inner.tree_store.reserve_leaves(&leaf_ids)?;
@@ -599,6 +642,7 @@ where
 
         Ok(SendTransferResult {
             transfer: transfer_resp.transfer,
+            ssp_swap_inbound_transfer_id: None,
         })
     }
 

@@ -53,6 +53,12 @@ pub enum SdkError {
 
     /// The operation failed after exhausting retries.
     OperationFailed,
+
+    /// The SSP swap request failed.
+    SspSwapFailed,
+
+    /// The SSP returned an unexpected or invalid response.
+    SspInvalidResponse,
 }
 
 impl fmt::Display for SdkError {
@@ -72,6 +78,8 @@ impl fmt::Display for SdkError {
             Self::DuplicateEntry => write!(f, "duplicate entry"),
             Self::InvalidRequest => write!(f, "invalid request"),
             Self::OperationFailed => write!(f, "operation failed"),
+            Self::SspSwapFailed => write!(f, "SSP swap failed"),
+            Self::SspInvalidResponse => write!(f, "invalid SSP response"),
         }
     }
 }

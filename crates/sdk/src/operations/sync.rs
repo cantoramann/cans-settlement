@@ -29,11 +29,12 @@ pub struct SyncResult {
     pub balance_sats: u64,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Synchronize local stores with operator state.
     ///

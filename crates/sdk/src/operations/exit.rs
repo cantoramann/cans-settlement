@@ -24,11 +24,12 @@ pub struct CooperativeExitResult {
     pub transfer: Option<spark::Transfer>,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Cooperatively exit BTC to a Layer 1 Bitcoin address.
     pub async fn cooperative_exit(

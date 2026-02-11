@@ -20,11 +20,12 @@ pub struct SyncTokensResult {
     pub token_types: usize,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: crate::tree::TreeStore,
     K: TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Synchronize token outputs from the coordinator.
     ///

@@ -32,11 +32,12 @@ pub enum SparkEvent {
     Connected,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Subscribe to events and automatically handle them.
     ///

@@ -48,11 +48,12 @@ pub struct ClaimTransferResult {
 // Sdk::claim_transfer
 // ---------------------------------------------------------------------------
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Claim pending BTC transfers addressed to this wallet.
     ///

@@ -308,6 +308,86 @@ pub fn sign_as_user(
         .map_err(|_| FrostError::SigningFailed)
 }
 
+/// Sign as the user participant with an adaptor public key.
+///
+/// Identical to [`sign_as_user`], but the `SigningPackage` is constructed
+/// with the adaptor via [`SigningPackage::new_with_adaptor`].  This ensures
+/// the group commitment includes `T` (the adaptor point), producing an
+/// adaptor signature share that the coordinator can aggregate into a valid
+/// adaptor signature `(r, s')`.
+///
+/// # Arguments
+///
+/// * `message` -- The sighash to sign
+/// * `signing_key` -- The user's secret key share
+/// * `public_key` -- The user's public key
+/// * `verifying_key` -- The group's aggregate public key
+/// * `nonces` -- The nonces generated in round 1
+/// * `all_commitments` -- All participants' commitments (including self)
+/// * `adaptor_pk` -- The adaptor public key `T = t * G`
+///
+/// # Errors
+///
+/// Returns [`FrostError::SigningFailed`] if key conversion or signing fails.
+pub fn sign_as_user_with_adaptor(
+    message: &[u8],
+    signing_key: &SecretKey,
+    public_key: &PublicKey,
+    verifying_key: &PublicKey,
+    nonces: &SigningNonces,
+    all_commitments: &BTreeMap<Identifier, SigningCommitments>,
+    adaptor_pk: &PublicKey,
+) -> Result<SignatureShare, FrostError> {
+    let user_id = user_identifier();
+
+    let operator_group: BTreeSet<Identifier> = all_commitments
+        .keys()
+        .filter(|id| **id != user_id)
+        .cloned()
+        .collect();
+    let user_group = BTreeSet::from([user_id]);
+    let groups = vec![operator_group, user_group];
+
+    let adaptor_vk = VerifyingKey::deserialize(&adaptor_pk.serialize())
+        .map_err(|_| FrostError::SigningFailed)?;
+
+    let signing_package = SigningPackage::new_with_adaptor(
+        all_commitments.clone(),
+        Some(groups),
+        message,
+        Some(adaptor_vk),
+    );
+
+    let signing_share = SigningShare::deserialize(&signing_key.secret_bytes())
+        .map_err(|_| FrostError::SigningFailed)?;
+    let verifying_share = VerifyingShare::deserialize(&public_key.serialize())
+        .map_err(|_| FrostError::SigningFailed)?;
+    let group_verifying_key = VerifyingKey::deserialize(&verifying_key.serialize())
+        .map_err(|_| FrostError::SigningFailed)?;
+
+    let raw_kp = KeyPackage::new(
+        user_id,
+        signing_share,
+        verifying_share,
+        group_verifying_key,
+        1,
+    );
+
+    let tweaked = raw_kp.clone().tweak(Some(&[] as &[u8]));
+    let even_y = raw_kp.into_even_y(Some(group_verifying_key.has_even_y()));
+
+    let final_kp = KeyPackage::new(
+        *even_y.identifier(),
+        *even_y.signing_share(),
+        *even_y.verifying_share(),
+        *tweaked.verifying_key(),
+        *tweaked.min_signers(),
+    );
+
+    frost_secp256k1_tr::round2::sign(&signing_package, nonces, &final_kp)
+        .map_err(|_| FrostError::SigningFailed)
+}
+
 /// Aggregate FROST signature shares using nested signing groups.
 ///
 /// Uses the same nested-group structure as [`sign_as_user`]: operators in one
@@ -345,6 +425,70 @@ pub fn aggregate_nested(
 
     let signing_package =
         SigningPackage::new_with_participants_groups(all_commitments, Some(groups), message);
+
+    let mut frost_verifying_shares = BTreeMap::new();
+    for (id, pk) in verifying_shares {
+        let vs = VerifyingShare::deserialize(&pk.serialize())
+            .map_err(|_| FrostError::AggregationFailed)?;
+        frost_verifying_shares.insert(*id, vs);
+    }
+
+    let group_verifying_key = VerifyingKey::deserialize(&verifying_key.serialize())
+        .map_err(|_| FrostError::AggregationFailed)?;
+
+    let public_key_package = PublicKeyPackage::new(frost_verifying_shares, group_verifying_key);
+
+    frost_secp256k1_tr::aggregate_with_tweak(
+        &signing_package,
+        signature_shares,
+        &public_key_package,
+        Some(b""),
+    )
+    .map_err(|_| FrostError::AggregationFailed)
+}
+
+/// Aggregate FROST signature shares with an adaptor public key.
+///
+/// Identical to [`aggregate_nested`], but the `SigningPackage` includes the
+/// adaptor point via [`SigningPackage::new_with_adaptor`].  The resulting
+/// signature is an adaptor signature `(r, s')` that can only be completed
+/// by adding the adaptor secret `t`.
+///
+/// # Arguments
+///
+/// * `message` -- The message that was signed
+/// * `all_commitments` -- All participants' commitments
+/// * `signature_shares` -- All participants' signature shares
+/// * `verifying_shares` -- All participants' public keys
+/// * `verifying_key` -- The group's aggregate public key
+/// * `adaptor_pk` -- The adaptor public key `T = t * G`
+///
+/// # Errors
+///
+/// Returns [`FrostError::AggregationFailed`] if key conversion or aggregation fails.
+pub fn aggregate_nested_with_adaptor(
+    message: &[u8],
+    all_commitments: BTreeMap<Identifier, SigningCommitments>,
+    signature_shares: &BTreeMap<Identifier, SignatureShare>,
+    verifying_shares: &BTreeMap<Identifier, PublicKey>,
+    verifying_key: &PublicKey,
+    adaptor_pk: &PublicKey,
+) -> Result<frost_secp256k1_tr::Signature, FrostError> {
+    let user_id = user_identifier();
+
+    let operator_group: BTreeSet<Identifier> = all_commitments
+        .keys()
+        .filter(|id| **id != user_id)
+        .cloned()
+        .collect();
+    let user_group = BTreeSet::from([user_id]);
+    let groups = vec![operator_group, user_group];
+
+    let adaptor_vk = VerifyingKey::deserialize(&adaptor_pk.serialize())
+        .map_err(|_| FrostError::AggregationFailed)?;
+
+    let signing_package =
+        SigningPackage::new_with_adaptor(all_commitments, Some(groups), message, Some(adaptor_vk));
 
     let mut frost_verifying_shares = BTreeMap::new();
     for (id, pk) in verifying_shares {

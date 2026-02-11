@@ -75,7 +75,12 @@ pub(crate) fn verify_and_decrypt_transfer(
         let payload_hash = bitcoin::hashes::sha256::Hash::hash(&payload);
 
         if !transfer_leaf.signature.is_empty() {
+            // Signatures may arrive as compact (64 bytes, r||s) or DER (~70-72
+            // bytes).  The SSP sends DER; user-to-user transfers send compact.
             let sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&transfer_leaf.signature)
+                .or_else(|_| {
+                    bitcoin::secp256k1::ecdsa::Signature::from_der(&transfer_leaf.signature)
+                })
                 .map_err(|_| SdkError::InvalidOperatorResponse)?;
 
             let msg = bitcoin::secp256k1::Message::from_digest(payload_hash.to_byte_array());

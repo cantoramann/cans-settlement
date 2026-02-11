@@ -15,6 +15,7 @@ pub mod deposit;
 pub mod events;
 pub mod exit;
 pub mod lightning;
+pub mod swap;
 pub mod sync;
 pub mod sync_tokens;
 pub mod token;

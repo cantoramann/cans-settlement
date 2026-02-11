@@ -114,6 +114,7 @@ fn make_sdk_with_wallets(
         wallet_store,
         InMemoryTreeStore::new(),
         InMemoryTokenStore::new(),
+        sdk::ssp::NoSspClient,
         CancellationToken::new(),
     )
     .expect("SDK construction should succeed")
@@ -145,6 +146,42 @@ fn make_sdk_with_wallet(
         wallet_store,
         InMemoryTreeStore::new(),
         InMemoryTokenStore::new(),
+        sdk::ssp::NoSspClient,
+        CancellationToken::new(),
+    )
+    .expect("SDK construction should succeed")
+}
+
+/// Constructs an SDK with a single wallet and a real SSP client.
+fn make_sdk_with_ssp(
+    mnemonic: &Mnemonic,
+    pubkey: &IdentityPubKey,
+    account: u32,
+) -> Sdk<InMemoryWalletStore, InMemoryTreeStore, InMemoryTokenStore, sdk::ssp::GraphqlSspClient> {
+    let wallet_store = InMemoryWalletStore::new();
+    wallet_store
+        .insert(
+            *pubkey,
+            WalletEntry {
+                seed: mnemonic.to_seed("").to_vec(),
+                account,
+            },
+        )
+        .expect("insert wallet");
+
+    let config = SdkConfig {
+        network: NETWORK_CONFIG,
+    };
+
+    let ssp_client =
+        sdk::ssp::GraphqlSspClient::from_config(&NETWORK_CONFIG.ssp).expect("valid SSP config");
+
+    Sdk::new(
+        config,
+        wallet_store,
+        InMemoryTreeStore::new(),
+        InMemoryTokenStore::new(),
+        ssp_client,
         CancellationToken::new(),
     )
     .expect("SDK construction should succeed")
@@ -805,4 +842,133 @@ async fn fund_claim_send_to_self() {
     );
 
     println!("===================================================\n");
+}
+
+// ===========================================================================
+// Tests: SSP Swap (requires network + funding-client faucet)
+// ===========================================================================
+
+/// End-to-end: fund with 2 sats, then trigger SSP swap via send_transfer.
+///
+/// The faucet sends us 2 sats (typically as a single 2-sat leaf).
+/// We then `send_transfer` 1 sat to self.  Since the selected leaf (2 sat)
+/// exceeds the send amount (1 sat), `send_transfer` automatically triggers
+/// an SSP swap to split it into [1, 1].  We then claim the SSP's inbound
+/// transfer and verify the final state.
+///
+/// If the faucet sends two 1-sat leaves instead, `select_leaves_greedy`
+/// picks one exact leaf (no change) and the non-swap path executes.
+/// Both paths are valid and the test adapts accordingly.
+///
+/// Run:
+/// ```bash
+/// cargo test -p sdk --test e2e ssp_swap_via_send -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires network access and funding-client faucet"]
+async fn ssp_swap_via_send() {
+    // 1. Generate wallet with SSP client.
+    let mnemonic = resolve_mnemonic("E2E_WALLET_A_MNEMONIC");
+    let (signer, pubkey) = wallet_from_mnemonic(&mnemonic, ACCOUNT_A);
+    let spark_address = encode_spark_address(Network::Regtest, &pubkey);
+
+    let sdk = make_sdk_with_ssp(&mnemonic, &pubkey, ACCOUNT_A);
+
+    println!("\n========== SSP Swap via send_transfer ==========");
+    println!("  Wallet pubkey:  {}", hex_encode(&pubkey));
+    println!("  Spark address:  {spark_address}");
+
+    // 2. Request 2 sats from the faucet.
+    println!("\n  [Step 1] Requesting 2 sats from faucet...");
+
+    let faucet = funding_client::FundingClient::new().await;
+    let fund_results = faucet
+        .request_funds(vec![funding_client::FundingTask {
+            amount_sats: 2,
+            recipient: spark_address.clone(),
+        }])
+        .await
+        .expect("funding request should succeed");
+
+    assert_eq!(fund_results.len(), 1);
+    println!(
+        "    Funded: {} sats, status: {}",
+        fund_results[0].amount_sent, fund_results[0].status
+    );
+
+    // 3. Wait for propagation, then claim.
+    println!("\n  [Step 2] Waiting 10 seconds for transfer propagation...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    println!("  [Step 3] Claiming incoming transfer...");
+    let claim_result = sdk
+        .claim_transfer(&pubkey, &signer)
+        .await
+        .expect("claim should succeed");
+
+    println!("    Claimed: {} leaves", claim_result.leaves_claimed);
+    assert!(
+        claim_result.leaves_claimed > 0,
+        "should claim at least one leaf"
+    );
+
+    // 4. Verify balance.
+    let balance = sdk
+        .query_balance(&pubkey)
+        .await
+        .expect("balance query should succeed");
+
+    println!("    Balance: {} sats", balance.btc_available_sats);
+    assert!(
+        balance.btc_available_sats >= 2,
+        "should have at least 2 sats"
+    );
+
+    // 5. Send 1 sat to self.
+    //    If we have a single 2-sat leaf => change=1 => SSP swap triggered.
+    //    If we have two 1-sat leaves   => exact match => direct transfer.
+    println!("\n  [Step 4] Sending 1 sat to self...");
+
+    let result = sdk.send_transfer(&pubkey, &pubkey, 1, &signer).await;
+
+    match &result {
+        Ok(r) => {
+            if let Some(ref swap_id) = r.ssp_swap_inbound_transfer_id {
+                println!("    SSP swap triggered!");
+                println!("    Inbound transfer ID: {swap_id}");
+
+                // 6. Claim the SSP swap's inbound transfer.
+                println!("\n  [Step 5] Waiting 5 seconds for SSP swap inbound...");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                println!("  [Step 6] Claiming SSP swap inbound transfer...");
+                let swap_claim = sdk
+                    .claim_transfer(&pubkey, &signer)
+                    .await
+                    .expect("SSP swap claim should succeed");
+
+                println!("    Claimed: {} leaves", swap_claim.leaves_claimed);
+
+                // 7. Verify final balance.
+                let final_balance = sdk
+                    .query_balance(&pubkey)
+                    .await
+                    .expect("final balance query should succeed");
+
+                println!(
+                    "\n  [Step 7] Final: {} sats",
+                    final_balance.btc_available_sats
+                );
+            } else {
+                println!("    Direct transfer (no change, no SSP swap needed).");
+                println!("    Transfer ID: {:?}", r.transfer.as_ref().map(|t| &t.id));
+            }
+        }
+        Err(e) => {
+            println!("    Failed: {e}");
+        }
+    }
+
+    result.expect("send_transfer should succeed");
+    println!("=================================================\n");
 }

@@ -37,11 +37,12 @@ pub struct CreateInvoiceResult {
     pub payment_hash: [u8; 32],
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Pay a Lightning invoice by initiating a preimage swap.
     pub async fn pay_invoice(

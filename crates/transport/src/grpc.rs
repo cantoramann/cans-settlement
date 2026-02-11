@@ -680,6 +680,22 @@ impl GrpcTransport {
             .map_err(grpc_status_to_error)
     }
 
+    /// Initiate a swap primary transfer on the coordinator.
+    ///
+    /// This is the first step of a V3 SSP swap: the user sends their
+    /// leaves to the coordinator with adaptor public keys, and the
+    /// coordinator returns signing results for FROST aggregation.
+    pub async fn initiate_swap_primary_transfer(
+        &self,
+        request: crate::spark::InitiateSwapPrimaryTransferRequest,
+    ) -> Result<crate::spark::InitiateSwapPrimaryTransferResponse, GrpcError> {
+        self.spark_coordinator_client()
+            .initiate_swap_primary_transfer(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
     /// Cooperative exit (v2) on the coordinator.
     pub async fn cooperative_exit_v2(
         &self,
@@ -1084,6 +1100,18 @@ impl<'a> AuthenticatedTransport<'a> {
             .store_preimage_share(request)
             .await
             .map(|_| ())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Initiate a swap primary transfer on the coordinator.
+    pub async fn initiate_swap_primary_transfer(
+        &self,
+        request: crate::spark::InitiateSwapPrimaryTransferRequest,
+    ) -> Result<crate::spark::InitiateSwapPrimaryTransferResponse, GrpcError> {
+        self.coordinator_client()
+            .initiate_swap_primary_transfer(request)
+            .await
+            .map(|r| r.into_inner())
             .map_err(grpc_status_to_error)
     }
 

@@ -34,11 +34,12 @@ pub struct TokenBalance {
     pub amount: u128,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: crate::tree::TreeStore,
     K: TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Send tokens to a receiver.
     ///

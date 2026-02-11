@@ -55,6 +55,7 @@ pub mod error;
 pub mod frost_bridge;
 pub mod network;
 pub mod operations;
+pub mod ssp;
 pub mod token;
 pub mod tree;
 pub mod wallet_store;
@@ -67,6 +68,7 @@ use config::NetworkConfig;
 use tokio_util::sync::CancellationToken;
 use transport::grpc::{AuthenticatedTransport, GrpcConfig, GrpcTransport, OperatorConfig};
 
+use crate::ssp::SspClient;
 use crate::token::TokenStore;
 use crate::tree::TreeStore;
 use crate::wallet_store::WalletStore;
@@ -87,12 +89,13 @@ pub struct SdkConfig {
 // ---------------------------------------------------------------------------
 
 /// Shared state across all SDK operations.
-pub(crate) struct SdkInner<W, T, K> {
+pub(crate) struct SdkInner<W, T, K, S> {
     pub config: SdkConfig,
     pub transport: GrpcTransport,
     pub wallet_store: W,
     pub tree_store: T,
     pub token_store: K,
+    pub ssp: S,
     pub cancel: CancellationToken,
 }
 
@@ -106,12 +109,13 @@ pub(crate) struct SdkInner<W, T, K> {
 /// - `W`: Wallet key storage (resolves public key -> wallet entry)
 /// - `T`: BTC leaf storage (insert, reserve, finalize leaves)
 /// - `K`: Token output storage (acquire, release, track balances)
-pub struct Sdk<W, T, K> {
-    pub(crate) inner: Arc<SdkInner<W, T, K>>,
+/// - `S`: SSP client for leaf swaps (use [`ssp::NoSspClient`] if unused)
+pub struct Sdk<W, T, K, S = crate::ssp::NoSspClient> {
+    pub(crate) inner: Arc<SdkInner<W, T, K, S>>,
 }
 
-// Manual Clone: we don't require W, T, K to be Clone.
-impl<W, T, K> Clone for Sdk<W, T, K> {
+// Manual Clone: we don't require W, T, K, S to be Clone.
+impl<W, T, K, S> Clone for Sdk<W, T, K, S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -119,7 +123,7 @@ impl<W, T, K> Clone for Sdk<W, T, K> {
     }
 }
 
-impl<W, T, K> std::fmt::Debug for Sdk<W, T, K> {
+impl<W, T, K, S> std::fmt::Debug for Sdk<W, T, K, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sdk")
             .field("transport", &self.inner.transport)
@@ -127,11 +131,12 @@ impl<W, T, K> std::fmt::Debug for Sdk<W, T, K> {
     }
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: TokenStore,
+    S: SspClient,
 {
     /// Creates a new SDK instance.
     ///
@@ -146,6 +151,7 @@ where
         wallet_store: W,
         tree_store: T,
         token_store: K,
+        ssp: S,
         cancel: CancellationToken,
     ) -> Result<Self, SdkError> {
         let operators: Vec<OperatorConfig> = config
@@ -171,6 +177,7 @@ where
                 wallet_store,
                 tree_store,
                 token_store,
+                ssp,
                 cancel,
             }),
         })

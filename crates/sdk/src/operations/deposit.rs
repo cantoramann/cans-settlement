@@ -25,11 +25,12 @@ pub struct DepositAddress {
     pub verifying_key: Bytes,
 }
 
-impl<W, T, K> Sdk<W, T, K>
+impl<W, T, K, S> Sdk<W, T, K, S>
 where
     W: WalletStore,
     T: TreeStore,
     K: crate::token::TokenStore,
+    S: crate::ssp::SspClient,
 {
     /// Generate a new deposit address for receiving on-chain BTC.
     ///
