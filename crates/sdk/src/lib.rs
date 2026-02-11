@@ -58,6 +58,7 @@ pub mod operations;
 pub mod ssp;
 pub mod token;
 pub mod tree;
+pub(crate) mod utils;
 pub mod wallet_store;
 
 pub use error::SdkError;

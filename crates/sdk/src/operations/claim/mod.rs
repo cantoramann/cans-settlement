@@ -57,13 +57,37 @@ where
 {
     /// Claim pending BTC transfers addressed to this wallet.
     ///
-    /// Queries the coordinator for pending transfers, decrypts the leaf keys,
-    /// rotates the FROST keyshares, signs new refund transactions, and
-    /// finalizes the claim. Claimed leaves are inserted into the tree store.
+    /// Queries the coordinator for **all** pending transfers for this
+    /// receiver and claims them. Use [`Self::claim_by_transfer_id`] to
+    /// claim a specific transfer (e.g. an SSP swap inbound).
     pub async fn claim_transfer(
         &self,
         receiver_pubkey: &IdentityPubKey,
         signer: &impl WalletSigner,
+    ) -> Result<ClaimTransferResult, SdkError> {
+        self.claim_inner(receiver_pubkey, signer, None).await
+    }
+
+    /// Claim a specific pending transfer by its transfer ID.
+    ///
+    /// This is used by the SSP swap flow to claim only the inbound
+    /// transfer from the SSP, without affecting other pending transfers.
+    pub async fn claim_by_transfer_id(
+        &self,
+        receiver_pubkey: &IdentityPubKey,
+        transfer_id: &str,
+        signer: &impl WalletSigner,
+    ) -> Result<ClaimTransferResult, SdkError> {
+        self.claim_inner(receiver_pubkey, signer, Some(transfer_id))
+            .await
+    }
+
+    /// Shared claim logic with optional transfer ID filter.
+    async fn claim_inner(
+        &self,
+        receiver_pubkey: &IdentityPubKey,
+        signer: &impl WalletSigner,
+        transfer_id: Option<&str>,
     ) -> Result<ClaimTransferResult, SdkError> {
         self.check_cancelled()?;
 
@@ -77,6 +101,10 @@ where
 
         // 1. Query pending transfers.
         let network = crate::network::spark_network_proto(self.inner.config.network.network);
+        let transfer_ids = transfer_id
+            .map(|id| vec![id.to_owned()])
+            .unwrap_or_default();
+
         let pending = authed
             .query_pending_transfers(spark::TransferFilter {
                 participant: Some(
@@ -84,6 +112,7 @@ where
                         Bytes::copy_from_slice(receiver_pubkey),
                     ),
                 ),
+                transfer_ids,
                 network,
                 ..Default::default()
             })

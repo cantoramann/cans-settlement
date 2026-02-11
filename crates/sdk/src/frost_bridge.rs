@@ -24,7 +24,7 @@ use crate::SdkError;
 ///
 /// Returns [`SdkError::InvalidOperatorResponse`] if the hex is invalid.
 pub fn identifier_from_hex(hex_str: &str) -> Result<Identifier, SdkError> {
-    let bytes = hex_decode(hex_str).ok_or(SdkError::InvalidOperatorResponse)?;
+    let bytes = crate::utils::hex_decode(hex_str).ok_or(SdkError::InvalidOperatorResponse)?;
     Identifier::deserialize(&bytes).map_err(|_| SdkError::InvalidOperatorResponse)
 }
 
@@ -139,32 +139,4 @@ pub fn serialize_signature_share(share: &SignatureShare) -> Vec<u8> {
 /// Returns [`SdkError::SigningFailed`] if serialization fails.
 pub fn serialize_frost_signature(sig: &signer::FrostSignature) -> Result<Vec<u8>, SdkError> {
     sig.serialize().map_err(|_| SdkError::SigningFailed)
-}
-
-// ---------------------------------------------------------------------------
-// Hex helpers (zero-alloc for small inputs)
-// ---------------------------------------------------------------------------
-
-/// Decode a hex string to bytes. Returns `None` on invalid input.
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }

@@ -853,8 +853,7 @@ async fn fund_claim_send_to_self() {
 /// The faucet sends us 2 sats (typically as a single 2-sat leaf).
 /// We then `send_transfer` 1 sat to self.  Since the selected leaf (2 sat)
 /// exceeds the send amount (1 sat), `send_transfer` automatically triggers
-/// an SSP swap to split it into [1, 1].  We then claim the SSP's inbound
-/// transfer and verify the final state.
+/// an SSP swap, claims the inbound, and re-sends with exact leaves.
 ///
 /// If the faucet sends two 1-sat leaves instead, `select_leaves_greedy`
 /// picks one exact leaf (no change) and the non-swap path executes.
@@ -925,50 +924,34 @@ async fn ssp_swap_via_send() {
     );
 
     // 5. Send 1 sat to self.
-    //    If we have a single 2-sat leaf => change=1 => SSP swap triggered.
-    //    If we have two 1-sat leaves   => exact match => direct transfer.
-    println!("\n  [Step 4] Sending 1 sat to self...");
+    //    send_transfer now handles the SSP swap + claim + re-send transparently.
+    //    If change > 0, it swaps via SSP, claims by transfer ID, re-selects
+    //    exact leaves, and completes the direct transfer -- all in one call.
+    println!("\n  [Step 4] Sending 1 sat to self (SSP swap handled inline)...");
 
-    let result = sdk.send_transfer(&pubkey, &pubkey, 1, &signer).await;
+    let result = sdk
+        .send_transfer(&pubkey, &pubkey, 1, &signer)
+        .await
+        .expect("send_transfer should succeed");
 
-    match &result {
-        Ok(r) => {
-            if let Some(ref swap_id) = r.ssp_swap_inbound_transfer_id {
-                println!("    SSP swap triggered!");
-                println!("    Inbound transfer ID: {swap_id}");
+    println!(
+        "    Transfer ID: {:?}",
+        result.transfer.as_ref().map(|t| &t.id)
+    );
 
-                // 6. Claim the SSP swap's inbound transfer.
-                println!("\n  [Step 5] Waiting 5 seconds for SSP swap inbound...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // 6. Verify final balance.
+    //    After claiming the SSP inbound (which send_transfer does inline),
+    //    the receiver gets 1 sat as a direct transfer. The sender keeps the
+    //    change leaf from the SSP swap (already in the tree store).
+    let final_balance = sdk
+        .query_balance(&pubkey)
+        .await
+        .expect("final balance query should succeed");
 
-                println!("  [Step 6] Claiming SSP swap inbound transfer...");
-                let swap_claim = sdk
-                    .claim_transfer(&pubkey, &signer)
-                    .await
-                    .expect("SSP swap claim should succeed");
+    println!(
+        "\n  [Step 5] Final: {} sats",
+        final_balance.btc_available_sats
+    );
 
-                println!("    Claimed: {} leaves", swap_claim.leaves_claimed);
-
-                // 7. Verify final balance.
-                let final_balance = sdk
-                    .query_balance(&pubkey)
-                    .await
-                    .expect("final balance query should succeed");
-
-                println!(
-                    "\n  [Step 7] Final: {} sats",
-                    final_balance.btc_available_sats
-                );
-            } else {
-                println!("    Direct transfer (no change, no SSP swap needed).");
-                println!("    Transfer ID: {:?}", r.transfer.as_ref().map(|t| &t.id));
-            }
-        }
-        Err(e) => {
-            println!("    Failed: {e}");
-        }
-    }
-
-    result.expect("send_transfer should succeed");
     println!("=================================================\n");
 }

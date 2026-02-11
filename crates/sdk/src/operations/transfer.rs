@@ -26,22 +26,18 @@
 //!
 //! See [`crate::operations::claim`] for the claim (receive) flow.
 
-use std::collections::HashMap;
-
-use bitcoin::consensus::deserialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bytes::Bytes;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use signer::WalletSigner;
 use transport::spark;
 
-use crate::bitcoin_tx::{
-    compressed_to_xonly, create_cpfp_refund_tx, create_direct_refund_tx, parse_tx, serialize_tx,
-    taproot_sighash,
-};
+use crate::bitcoin_tx::{compressed_to_xonly, create_direct_refund_tx, parse_tx, serialize_tx};
 use crate::frost_bridge::commitment_to_proto;
 use crate::network::bitcoin_network;
+use crate::operations::transfer_core::{
+    self, BuildLeafParams, LeafTransferContext, build_cpfp_signing_job, build_key_tweak_package,
+    frost_sign_user_share, generate_uuid_v4, next_send_sequence, one_hour_expiry,
+    sign_transfer_package,
+};
 use crate::tree::{TreeStore, select_leaves_greedy};
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
@@ -53,61 +49,25 @@ use crate::{Sdk, SdkError};
 /// Response from a send transfer operation.
 pub struct SendTransferResult {
     /// The transfer proto returned by the coordinator.
-    ///
-    /// `None` when an SSP swap was performed (the caller must claim the
-    /// swap's inbound transfer first, then re-send).
     pub transfer: Option<spark::Transfer>,
-
-    /// If an SSP swap was triggered to handle change, this contains the
-    /// inbound transfer ID that the caller must claim to receive the
-    /// exact-denomination leaves from the SSP.
-    pub ssp_swap_inbound_transfer_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Internal: per-leaf send data
+// Transfer-specific: direct refund data layered on top of LeafTransferContext
 // ---------------------------------------------------------------------------
 
-/// Prepared send data for a single leaf before FROST signing.
-#[allow(dead_code)] // ephemeral_sk/pk stored for potential retry/debug paths.
-struct LeafSendContext {
-    leaf_id: String,
-    /// Sender's current signing secret key for this leaf.
-    current_sk: SecretKey,
-    /// Sender's current signing public key for this leaf.
-    current_pk: PublicKey,
-    /// Randomly generated ephemeral secret key.
-    ephemeral_sk: SecretKey,
-    /// Ephemeral public key (refund outputs pay here).
-    ephemeral_pk: PublicKey,
-    /// The verifying (group aggregate) public key for FROST.
-    verifying_public_key: [u8; 33],
-    /// CPFP refund transaction.
-    cpfp_refund_tx: bitcoin::Transaction,
+/// Additional per-leaf data for direct refund paths (not used by SSP swaps).
+struct DirectRefundData {
     /// Direct-from-CPFP refund transaction.
     direct_from_cpfp_refund_tx: bitcoin::Transaction,
     /// Direct refund transaction (if direct_tx exists on the leaf).
     direct_refund_tx: Option<bitcoin::Transaction>,
-    /// Prev out from node_tx (for CPFP and direct-from-CPFP sighash).
-    prev_out: bitcoin::TxOut,
     /// Prev out from direct_tx (for direct sighash), if present.
     direct_prev_out: Option<bitcoin::TxOut>,
-    /// FROST nonces for CPFP refund.
-    cpfp_nonce_pair: spark_crypto::frost::FrostNoncePair,
     /// FROST nonces for direct-from-CPFP refund.
     direct_from_cpfp_nonce_pair: spark_crypto::frost::FrostNoncePair,
     /// FROST nonces for direct refund (if applicable).
     direct_nonce_pair: Option<spark_crypto::frost::FrostNoncePair>,
-    /// ECIES-encrypted ephemeral key for receiver.
-    secret_cipher: Vec<u8>,
-    /// Per-operator SendLeafKeyTweak data (before ECDSA signature over leaf_id||transfer_id||secret_cipher).
-    per_operator_tweaks: Vec<PerOperatorTweak>,
-}
-
-/// Per-operator tweak data for a single leaf.
-struct PerOperatorTweak {
-    secret_share_tweak: spark::SecretShare,
-    pubkey_shares_tweak: HashMap<String, Bytes>,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,31 +117,56 @@ where
 
         let change = total - amount_sats;
 
-        // 2. If there's change, perform an SSP swap first.
-        //    The SSP swap splits the selected leaves into exact denominations:
-        //    one leaf for `amount_sats` (to send) and one for `change` (returned
-        //    to the sender as an inbound transfer to claim).
+        // 2. If there's change, SSP swap first.
+        //    `ssp_swap` sends the oversized leaves to the SSP, claims the
+        //    inbound transfer, and inserts the exact-denomination leaves
+        //    into the tree store. We then re-select and proceed.
         if change > 0 {
             let fee = crate::ssp::SSP_SWAP_FEE_SATS;
             let target_amounts = vec![amount_sats, change.saturating_sub(fee)];
 
-            let swap_result = self
-                .ssp_swap(sender_pubkey, &selected, &target_amounts, signer)
+            self.ssp_swap(sender_pubkey, &selected, &target_amounts, signer)
                 .await?;
 
-            // The SSP sends new leaves back as an inbound transfer.
-            // The caller must claim the transfer (via `claim_transfer`) to
-            // obtain the exact-denomination leaves.  For now, we return
-            // the swap result info in the response and don't proceed with
-            // the second transfer -- the caller should claim, then re-call
-            // send_transfer with the exact leaf.
-            //
-            // TODO: Once claim is wired up inline, chain the claim + send
-            //       automatically so the user doesn't need two round-trips.
-            return Ok(SendTransferResult {
-                transfer: None,
-                ssp_swap_inbound_transfer_id: Some(swap_result.inbound_transfer_id),
-            });
+            // Remove the leaves we sent to the SSP -- they're no longer ours.
+            let spent_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
+            self.inner.tree_store.remove_leaves(&spent_ids)?;
+
+            // Re-authenticate: the swap's internal claim may have cycled
+            // the session token with the coordinator.
+            let authed = self.authenticate(signer).await?;
+
+            // Re-select from the freshly claimed leaves.
+            let refreshed = self.inner.tree_store.get_available_leaves()?;
+            let (re_selected, _re_total) = select_leaves_greedy(&refreshed, amount_sats)
+                .ok_or(SdkError::InsufficientBalance)?;
+
+            let leaf_ids: Vec<&str> = re_selected.iter().map(|l| l.id.as_str()).collect();
+            let reservation = self.inner.tree_store.reserve_leaves(&leaf_ids)?;
+
+            let result = self
+                .send_transfer_inner(
+                    &authed,
+                    &reservation,
+                    sender_pubkey,
+                    receiver_pubkey,
+                    signer,
+                    network,
+                )
+                .await;
+
+            return match result {
+                Ok(resp) => {
+                    self.inner
+                        .tree_store
+                        .finalize_reservation(reservation.id, None)?;
+                    Ok(resp)
+                }
+                Err(e) => {
+                    let _ = self.inner.tree_store.cancel_reservation(reservation.id);
+                    Err(e)
+                }
+            };
         }
 
         let leaf_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
@@ -225,128 +210,55 @@ where
         signer: &impl WalletSigner,
         network: bitcoin::Network,
     ) -> Result<SendTransferResult, SdkError> {
-        let secp = Secp256k1::new();
         let num_operators = self.inner.config.network.num_operators();
         let threshold = self.inner.config.network.threshold;
         let operators = self.inner.config.network.operators();
+        let operator_ids: Vec<String> = operators.iter().map(|o| o.id.to_string()).collect();
         let mut rng = rand_core::OsRng;
 
-        // 2. Prepare per-leaf send contexts: ephemeral key, tweaks, refund txs, nonces.
-        let mut leaf_contexts: Vec<LeafSendContext> = Vec::with_capacity(reservation.leaves.len());
+        // Receiver xonly for direct refunds.
+        let receiver_xonly = compressed_to_xonly(receiver_pubkey).ok_or(SdkError::SigningFailed)?;
+
+        // 2. Build per-leaf contexts (shared) + direct refund data (transfer-specific).
+        let mut leaf_contexts: Vec<LeafTransferContext> =
+            Vec::with_capacity(reservation.leaves.len());
+        let mut direct_data: Vec<DirectRefundData> = Vec::with_capacity(reservation.leaves.len());
 
         for leaf in &reservation.leaves {
-            let (current_sk, current_pk) = signer
-                .derive_signing_keypair(&leaf.id)
-                .map_err(|_| SdkError::SigningFailed)?;
-
-            // Generate random ephemeral keypair.
-            let mut eph_bytes = [0u8; 32];
-            rand_core::RngCore::fill_bytes(&mut rng, &mut eph_bytes);
-            let ephemeral_sk =
-                SecretKey::from_slice(&eph_bytes).expect("32 random bytes always valid");
-            let ephemeral_pk = PublicKey::from_secret_key(&secp, &ephemeral_sk);
-
-            // Compute key tweak: current - ephemeral.
-            let key_tweak = signer
-                .subtract_secret_keys(&current_sk, &ephemeral_sk)
-                .map_err(|_| SdkError::SigningFailed)?;
-
-            // VSS-split the tweak.
-            let shares = signer
-                .vss_split(
-                    &key_tweak.secret_bytes(),
-                    threshold,
+            let ctx = transfer_core::build_leaf_context(
+                &BuildLeafParams {
+                    leaf_id: &leaf.id,
+                    node_tx: &leaf.node_tx,
+                    refund_tx: leaf.refund_tx.as_deref(),
+                    vout: leaf.vout,
+                    verifying_public_key: leaf.verifying_public_key,
+                    receiver_pk: receiver_pubkey,
+                    network,
                     num_operators,
-                    &mut rng,
-                )
-                .map_err(|_| SdkError::SigningFailed)?;
+                    threshold,
+                    operator_ids: &operator_ids,
+                },
+                signer,
+                &mut rng,
+            )?;
 
-            // Build pubkey_shares_tweak: operator ID -> compressed pubkey of their share.
-            let mut pubkey_shares_tweak: HashMap<String, Bytes> = HashMap::new();
-            for (i, share) in shares.iter().enumerate() {
-                let share_bytes = spark_crypto::verifiable_secret_sharing::scalar_to_bytes(
-                    &share.secret_share.share,
-                );
-                let share_sk =
-                    SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
-                let share_pk = PublicKey::from_secret_key(&secp, &share_sk);
-                pubkey_shares_tweak.insert(
-                    operators[i].id.to_string(),
-                    Bytes::copy_from_slice(&share_pk.serialize()),
-                );
-            }
-
-            // Build per-operator tweak data.
-            let mut per_operator_tweaks = Vec::with_capacity(num_operators);
-            for (i, share) in shares.iter().enumerate() {
-                let share_bytes = spark_crypto::verifiable_secret_sharing::scalar_to_bytes(
-                    &share.secret_share.share,
-                );
-                let proofs: Vec<Bytes> = share
-                    .proofs
-                    .iter()
-                    .map(|p| {
-                        let point = p.to_encoded_point(true);
-                        Bytes::copy_from_slice(point.as_bytes())
-                    })
-                    .collect();
-
-                let _ = i; // index used for operator ordering
-                per_operator_tweaks.push(PerOperatorTweak {
-                    secret_share_tweak: spark::SecretShare {
-                        secret_share: Bytes::copy_from_slice(&share_bytes),
-                        proofs,
-                    },
-                    pubkey_shares_tweak: pubkey_shares_tweak.clone(),
-                });
-            }
-
-            // ECIES-encrypt ephemeral key for receiver.
-            let secret_cipher = signer
-                .ecies_encrypt(receiver_pubkey, &ephemeral_sk.secret_bytes(), &mut rng)
-                .map_err(|_| SdkError::SigningFailed)?;
-
-            // Build refund transactions paying to receiver's identity key.
-            // Refunds must be claimable by the receiver even if they never learn
-            // the ephemeral key, so the output key is the receiver's public key.
-            let receiver_xonly =
-                compressed_to_xonly(receiver_pubkey).ok_or(SdkError::SigningFailed)?;
-
+            // Build direct refund txs (transfer-specific, not needed for swaps).
             let node_tx = parse_tx(&leaf.node_tx).map_err(|_| SdkError::InvalidRequest)?;
-            let prev_out = node_tx
-                .output
-                .first()
-                .ok_or(SdkError::InvalidRequest)?
-                .clone();
             let node_txid = node_tx.compute_txid();
 
-            // Extract sequences from existing refund txs and compute next
-            // (decremented) sequences for the send. Each transfer decrements
-            // the CPFP timelock by TIME_LOCK_INTERVAL (100). Direct sequences
-            // are CPFP + DIRECT_TIME_LOCK_OFFSET (50).
-            let old_cpfp_seq = extract_sequence(leaf.refund_tx.as_deref());
-            let (next_cpfp_seq, next_direct_seq) =
+            let old_cpfp_seq = transfer_core::extract_sequence(leaf.refund_tx.as_deref());
+            let (_next_cpfp_seq, next_direct_seq) =
                 next_send_sequence(old_cpfp_seq).ok_or(SdkError::InvalidRequest)?;
-
-            let cpfp_refund_tx = create_cpfp_refund_tx(
-                node_txid,
-                leaf.vout,
-                prev_out.value,
-                next_cpfp_seq,
-                &receiver_xonly,
-                network,
-            );
 
             let direct_from_cpfp_refund_tx = create_direct_refund_tx(
                 node_txid,
                 leaf.vout,
-                prev_out.value,
+                ctx.prev_out.value,
                 next_direct_seq,
                 &receiver_xonly,
                 network,
             );
 
-            // Direct refund tx (if direct_tx exists on the leaf).
             let (direct_refund_tx, direct_prev_out) = if let Some(ref direct_tx_raw) =
                 leaf.direct_tx
             {
@@ -369,12 +281,11 @@ where
                 (None, None)
             };
 
-            // Generate FROST nonces with the sender's **current** key.
+            // Generate additional FROST nonces for direct refund paths.
             let signing_share =
-                spark_crypto::frost::deserialize_signing_share(&current_sk.secret_bytes())
+                spark_crypto::frost::deserialize_signing_share(&ctx.current_sk.secret_bytes())
                     .map_err(|_| SdkError::SigningFailed)?;
 
-            let cpfp_nonce_pair = spark_crypto::frost::generate_nonces(&signing_share, &mut rng);
             let direct_from_cpfp_nonce_pair =
                 spark_crypto::frost::generate_nonces(&signing_share, &mut rng);
             let direct_nonce_pair = if direct_refund_tx.is_some() {
@@ -386,24 +297,15 @@ where
                 None
             };
 
-            leaf_contexts.push(LeafSendContext {
-                leaf_id: leaf.id.clone(),
-                current_sk,
-                current_pk,
-                ephemeral_sk,
-                ephemeral_pk,
-                verifying_public_key: leaf.verifying_public_key,
-                cpfp_refund_tx,
+            direct_data.push(DirectRefundData {
                 direct_from_cpfp_refund_tx,
                 direct_refund_tx,
-                prev_out,
                 direct_prev_out,
-                cpfp_nonce_pair,
                 direct_from_cpfp_nonce_pair,
                 direct_nonce_pair,
-                secret_cipher,
-                per_operator_tweaks,
             });
+
+            leaf_contexts.push(ctx);
         }
 
         // 3. Get signing commitments from coordinator.
@@ -418,10 +320,6 @@ where
             .await
             .map_err(|_| SdkError::TransportFailed)?;
 
-        // Parse the commitment ordering:
-        // For node_ids = [A, B] and count = 3, response is:
-        //   [commitment_A_0, commitment_B_0, commitment_A_1, commitment_B_1, commitment_A_2, commitment_B_2]
-        // Index 0 = CPFP, index 1 = direct, index 2 = direct-from-CPFP.
         let n_leaves = leaf_contexts.len();
         let commitments = &commitments_resp.signing_commitments;
 
@@ -432,65 +330,43 @@ where
             Vec::with_capacity(n_leaves);
 
         for (leaf_idx, ctx) in leaf_contexts.iter().enumerate() {
-            let pk_bytes = Bytes::copy_from_slice(&ctx.current_pk.serialize());
+            let dd = &direct_data[leaf_idx];
 
             // CPFP refund: commitment at index (0 * n_leaves + leaf_idx).
-            let cpfp_commitment_idx = leaf_idx;
             let cpfp_op_commitments = commitments
-                .get(cpfp_commitment_idx)
+                .get(leaf_idx)
                 .ok_or(SdkError::InvalidOperatorResponse)?;
-            let cpfp_user_commitment = commitment_to_proto(&ctx.cpfp_nonce_pair.commitment)
-                .map_err(|_| SdkError::SigningFailed)?;
 
-            let cpfp_sig = self
-                .frost_sign_and_aggregate_send(
-                    ctx,
-                    &ctx.cpfp_refund_tx,
-                    &ctx.cpfp_nonce_pair,
-                    cpfp_op_commitments,
-                    &ctx.prev_out,
-                    signer,
-                )
-                .await?;
+            let cpfp_sig = frost_sign_user_share(
+                ctx,
+                &ctx.cpfp_refund_tx,
+                &ctx.cpfp_nonce_pair,
+                cpfp_op_commitments,
+                &ctx.prev_out,
+            )?;
 
-            cpfp_jobs.push(spark::UserSignedTxSigningJob {
-                leaf_id: ctx.leaf_id.clone(),
-                signing_public_key: pk_bytes.clone(),
-                raw_tx: Bytes::copy_from_slice(&serialize_tx(&ctx.cpfp_refund_tx)),
-                signing_nonce_commitment: Some(cpfp_user_commitment),
-                user_signature: Bytes::copy_from_slice(&cpfp_sig),
-                signing_commitments: Some(spark::SigningCommitments {
-                    signing_commitments: cpfp_op_commitments.signing_nonce_commitments.clone(),
-                }),
-            });
+            cpfp_jobs.push(build_cpfp_signing_job(ctx, &cpfp_sig, cpfp_op_commitments));
 
             // Direct refund: commitment at index (1 * n_leaves + leaf_idx).
             let direct_commitment_idx = n_leaves + leaf_idx;
             if let (Some(dtx), Some(dnp), Some(dpo)) = (
-                &ctx.direct_refund_tx,
-                &ctx.direct_nonce_pair,
-                &ctx.direct_prev_out,
+                &dd.direct_refund_tx,
+                &dd.direct_nonce_pair,
+                &dd.direct_prev_out,
             ) {
                 let direct_op_commitments = commitments
                     .get(direct_commitment_idx)
                     .ok_or(SdkError::InvalidOperatorResponse)?;
+
+                let direct_sig = frost_sign_user_share(ctx, dtx, dnp, direct_op_commitments, dpo)?;
+
+                let pk_bytes = Bytes::copy_from_slice(&ctx.current_pk.serialize());
                 let direct_user_commitment =
                     commitment_to_proto(&dnp.commitment).map_err(|_| SdkError::SigningFailed)?;
 
-                let direct_sig = self
-                    .frost_sign_and_aggregate_send(
-                        ctx,
-                        dtx,
-                        dnp,
-                        direct_op_commitments,
-                        dpo,
-                        signer,
-                    )
-                    .await?;
-
                 direct_jobs.push(spark::UserSignedTxSigningJob {
                     leaf_id: ctx.leaf_id.clone(),
-                    signing_public_key: pk_bytes.clone(),
+                    signing_public_key: pk_bytes,
                     raw_tx: Bytes::copy_from_slice(&serialize_tx(dtx)),
                     signing_nonce_commitment: Some(direct_user_commitment),
                     user_signature: Bytes::copy_from_slice(&direct_sig),
@@ -507,25 +383,24 @@ where
             let dfcpfp_op_commitments = commitments
                 .get(dfcpfp_commitment_idx)
                 .ok_or(SdkError::InvalidOperatorResponse)?;
-            let dfcpfp_user_commitment =
-                commitment_to_proto(&ctx.direct_from_cpfp_nonce_pair.commitment)
-                    .map_err(|_| SdkError::SigningFailed)?;
 
-            let dfcpfp_sig = self
-                .frost_sign_and_aggregate_send(
-                    ctx,
-                    &ctx.direct_from_cpfp_refund_tx,
-                    &ctx.direct_from_cpfp_nonce_pair,
-                    dfcpfp_op_commitments,
-                    &ctx.prev_out,
-                    signer,
-                )
-                .await?;
+            let dfcpfp_sig = frost_sign_user_share(
+                ctx,
+                &dd.direct_from_cpfp_refund_tx,
+                &dd.direct_from_cpfp_nonce_pair,
+                dfcpfp_op_commitments,
+                &ctx.prev_out,
+            )?;
+
+            let pk_bytes = Bytes::copy_from_slice(&ctx.current_pk.serialize());
+            let dfcpfp_user_commitment =
+                commitment_to_proto(&dd.direct_from_cpfp_nonce_pair.commitment)
+                    .map_err(|_| SdkError::SigningFailed)?;
 
             direct_from_cpfp_jobs.push(spark::UserSignedTxSigningJob {
                 leaf_id: ctx.leaf_id.clone(),
                 signing_public_key: pk_bytes,
-                raw_tx: Bytes::copy_from_slice(&serialize_tx(&ctx.direct_from_cpfp_refund_tx)),
+                raw_tx: Bytes::copy_from_slice(&serialize_tx(&dd.direct_from_cpfp_refund_tx)),
                 signing_nonce_commitment: Some(dfcpfp_user_commitment),
                 user_signature: Bytes::copy_from_slice(&dfcpfp_sig),
                 signing_commitments: Some(spark::SigningCommitments {
@@ -534,76 +409,13 @@ where
             });
         }
 
-        // 5. Build key_tweak_package: operator_id -> ECIES(operator_pk, SendLeafTweaks).
-        //    Generate transfer_id (UUIDv4) client-side: the coordinator requires
-        //    a valid UUID and the ECDSA signature signs over leaf_id||transfer_id||secret_cipher.
+        // 5. Build key_tweak_package.
         let transfer_id = generate_uuid_v4(&mut rng);
-        let transfer_id_bytes = transfer_id.as_bytes();
+        let key_tweak_package =
+            build_key_tweak_package(&leaf_contexts, operators, signer, &transfer_id, &mut rng)?;
 
-        let mut key_tweak_package: HashMap<String, Bytes> = HashMap::new();
-
-        for (op_idx, op) in operators.iter().enumerate() {
-            let mut tweak_list: Vec<spark::SendLeafKeyTweak> =
-                Vec::with_capacity(leaf_contexts.len());
-
-            for ctx in &leaf_contexts {
-                // ECDSA signature: SHA256(leaf_id || transfer_id || secret_cipher).
-                let mut sig_payload = Vec::new();
-                sig_payload.extend_from_slice(ctx.leaf_id.as_bytes());
-                sig_payload.extend_from_slice(transfer_id_bytes);
-                sig_payload.extend_from_slice(&ctx.secret_cipher);
-
-                let payload_hash = bitcoin::hashes::sha256::Hash::hash(&sig_payload);
-                let sig_compact = signer.sign_ecdsa_digest_compact(payload_hash.as_byte_array());
-
-                let op_tweak = &ctx.per_operator_tweaks[op_idx];
-
-                tweak_list.push(spark::SendLeafKeyTweak {
-                    leaf_id: ctx.leaf_id.clone(),
-                    secret_share_tweak: Some(op_tweak.secret_share_tweak.clone()),
-                    pubkey_shares_tweak: op_tweak.pubkey_shares_tweak.clone(),
-                    secret_cipher: Bytes::copy_from_slice(&ctx.secret_cipher),
-                    signature: Bytes::copy_from_slice(&sig_compact),
-                    refund_signature: Bytes::new(),
-                    direct_refund_signature: Bytes::new(),
-                    direct_from_cpfp_refund_signature: Bytes::new(),
-                });
-            }
-
-            // Encode SendLeafKeyTweaks as proto bytes.
-            let tweaks_proto = spark::SendLeafKeyTweaks {
-                leaves_to_send: tweak_list,
-            };
-            let tweaks_bytes = prost::Message::encode_to_vec(&tweaks_proto);
-
-            // ECIES-encrypt for this operator.
-            let op_pubkey =
-                hex_decode_pubkey(op.identity_public_key).ok_or(SdkError::InvalidRequest)?;
-            let encrypted = signer
-                .ecies_encrypt(&op_pubkey, &tweaks_bytes, &mut rng)
-                .map_err(|_| SdkError::SigningFailed)?;
-
-            key_tweak_package.insert(op.id.to_string(), Bytes::from(encrypted));
-        }
-
-        // 6. Sign the transfer package (user_signature).
-        //    Payload = hex_decode(transfer_id without dashes)
-        //            + for each (key, value) in key_tweak_package sorted by key:
-        //                key_bytes + b":" + value_bytes + b";"
-        let transfer_id_hex = transfer_id.replace('-', "");
-        let transfer_id_raw = hex_decode_bytes(&transfer_id_hex).ok_or(SdkError::InvalidRequest)?;
-
-        let mut pairs: Vec<(&String, &Bytes)> = key_tweak_package.iter().collect();
-        pairs.sort_by_key(|(k, _)| (*k).clone());
-
-        let mut package_payload = transfer_id_raw;
-        for (key, value) in pairs {
-            package_payload.extend_from_slice(key.as_bytes());
-            package_payload.extend_from_slice(b":");
-            package_payload.extend_from_slice(value);
-            package_payload.extend_from_slice(b";");
-        }
-        let package_sig = signer.sign_ecdsa_message(&package_payload);
+        // 6. Sign the transfer package.
+        let package_sig = sign_transfer_package(&transfer_id, &key_tweak_package, signer)?;
 
         // 7. Assemble TransferPackage.
         let transfer_package = spark::TransferPackage {
@@ -616,24 +428,13 @@ where
         };
 
         // 8. Build and submit StartTransferRequest.
-        let expiry_time = {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let expiry = now + std::time::Duration::from_secs(3600); // 1 hour
-            Some(prost_types::Timestamp {
-                seconds: expiry.as_secs() as i64,
-                nanos: 0,
-            })
-        };
-
         let transfer_resp = authed
             .start_transfer_v2(spark::StartTransferRequest {
                 transfer_id: transfer_id.clone(),
                 owner_identity_public_key: Bytes::copy_from_slice(sender_pubkey),
                 receiver_identity_public_key: Bytes::copy_from_slice(receiver_pubkey),
                 transfer_package: Some(transfer_package),
-                expiry_time,
+                expiry_time: Some(one_hour_expiry()),
                 leaves_to_send: Vec::new(),
                 spark_invoice: String::new(),
             })
@@ -642,162 +443,6 @@ where
 
         Ok(SendTransferResult {
             transfer: transfer_resp.transfer,
-            ssp_swap_inbound_transfer_id: None,
         })
     }
-
-    /// FROST sign a refund tx on the **send** side and aggregate.
-    ///
-    /// Uses the sender's **current** key (not tweaked), which is the key
-    /// that currently controls the leaf. The FROST signature proves the
-    /// sender authorized the refund tx.
-    async fn frost_sign_and_aggregate_send(
-        &self,
-        ctx: &LeafSendContext,
-        refund_tx: &bitcoin::Transaction,
-        nonce_pair: &spark_crypto::frost::FrostNoncePair,
-        operator_commitments: &spark::RequestedSigningCommitments,
-        prev_out: &bitcoin::TxOut,
-        _signer: &impl WalletSigner,
-    ) -> Result<Vec<u8>, SdkError> {
-        // Parse operator commitments from the proto.
-        let mut op_commitments = std::collections::BTreeMap::new();
-        for (hex_id, proto_commitment) in &operator_commitments.signing_nonce_commitments {
-            let id = crate::frost_bridge::identifier_from_hex(hex_id)?;
-            let commitment = spark_crypto::frost::commitments_from_components(
-                &proto_commitment.hiding,
-                &proto_commitment.binding,
-            )
-            .map_err(|_| SdkError::InvalidOperatorResponse)?;
-            op_commitments.insert(id, commitment);
-        }
-
-        // Compute sighash for the refund tx.
-        let sighash = taproot_sighash(refund_tx, 0, std::slice::from_ref(prev_out))
-            .map_err(|_| SdkError::SigningFailed)?;
-
-        let user_identifier = spark_crypto::frost::user_identifier();
-
-        // Build complete commitments map: operator + user.
-        let mut all_commitments = op_commitments;
-        all_commitments.insert(user_identifier, nonce_pair.commitment);
-
-        let verifying_key = PublicKey::from_slice(&ctx.verifying_public_key)
-            .map_err(|_| SdkError::InvalidRequest)?;
-
-        // FROST round 2: sign with sender's current key.
-        let user_share = spark_crypto::frost::sign_as_user(
-            &sighash,
-            &ctx.current_sk,
-            &ctx.current_pk,
-            &verifying_key,
-            &nonce_pair.nonces,
-            &all_commitments,
-        )
-        .map_err(|_| SdkError::SigningFailed)?;
-
-        // We don't have operator signature shares at this point -- the
-        // TransferPackage flow sends the user's share + commitment to the
-        // coordinator, which aggregates with operator shares server-side.
-        // Return the user's signature share serialized.
-        let share_bytes = crate::frost_bridge::serialize_signature_share(&user_share);
-        Ok(share_bytes)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract nSequence from a raw refund transaction. Returns default 2000
-/// if the bytes are empty or unparseable.
-fn extract_sequence(raw: Option<&[u8]>) -> bitcoin::Sequence {
-    let bytes = match raw {
-        Some(b) if !b.is_empty() => b,
-        _ => return bitcoin::Sequence::from_consensus(2000),
-    };
-    deserialize::<bitcoin::Transaction>(bytes)
-        .ok()
-        .and_then(|tx| tx.input.first().map(|i| i.sequence))
-        .unwrap_or(bitcoin::Sequence::from_consensus(2000))
-}
-
-// Spark timelock constants (matching Breez SDK / coordinator expectations).
-const TIMELOCK_MASK: u32 = 0x0000_FFFF;
-const TIME_LOCK_INTERVAL: u16 = 100;
-const DIRECT_TIME_LOCK_OFFSET: u16 = 50;
-
-/// Compute the next (decremented) sequences for a send transfer.
-///
-/// Returns `(cpfp_sequence, direct_sequence)`.
-/// Returns `None` if the timelock is already too low to decrement.
-fn next_send_sequence(
-    current_cpfp_seq: bitcoin::Sequence,
-) -> Option<(bitcoin::Sequence, bitcoin::Sequence)> {
-    let raw = current_cpfp_seq.to_consensus_u32();
-    let timelock = (raw & TIMELOCK_MASK) as u16;
-    let next_timelock = timelock.checked_sub(TIME_LOCK_INTERVAL)?;
-    let flags = raw & !TIMELOCK_MASK; // Preserve upper flag bits (e.g. SPARK_SEQUENCE_FLAG).
-    let cpfp = bitcoin::Sequence::from_consensus(flags | u32::from(next_timelock));
-    let direct = bitcoin::Sequence::from_consensus(
-        flags | u32::from(next_timelock + DIRECT_TIME_LOCK_OFFSET),
-    );
-    Some((cpfp, direct))
-}
-
-/// Decode an arbitrary hex string to bytes.
-fn hex_decode_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-/// Decode a hex-encoded compressed public key (66 hex chars) to 33 bytes.
-fn hex_decode_pubkey(hex: &str) -> Option<[u8; 33]> {
-    if hex.len() != 66 {
-        return None;
-    }
-    let mut out = [0u8; 33];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Generate a UUIDv4 string from random bytes (no external crate needed).
-fn generate_uuid_v4<R: rand_core::RngCore>(rng: &mut R) -> String {
-    let mut bytes = [0u8; 16];
-    rng.fill_bytes(&mut bytes);
-    // Set version (4) and variant (RFC 4122).
-    bytes[6] = (bytes[6] & 0x0F) | 0x40; // Version 4
-    bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variant 10xx
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_be_bytes([bytes[4], bytes[5]]),
-        u16::from_be_bytes([bytes[6], bytes[7]]),
-        u16::from_be_bytes([bytes[8], bytes[9]]),
-        // Last 6 bytes as a single u64 (only lower 48 bits used).
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        ]),
-    )
 }

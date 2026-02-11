@@ -167,8 +167,8 @@ impl GraphqlSspClient {
     pub fn from_config(ssp: &config::SspConfig) -> Result<Self, SdkError> {
         let url = format!("{}/{}", ssp.base_url, ssp.schema_endpoint);
 
-        let pk_bytes =
-            crate::ssp::hex_decode_33(ssp.identity_public_key).ok_or(SdkError::InvalidRequest)?;
+        let pk_bytes = crate::utils::hex_decode_pubkey(ssp.identity_public_key)
+            .ok_or(SdkError::InvalidRequest)?;
         let identity_pk = PublicKey::from_slice(&pk_bytes).map_err(|_| SdkError::InvalidRequest)?;
 
         Ok(Self { url, identity_pk })
@@ -225,7 +225,7 @@ impl GraphqlSspClient {
             .map_err(|_| SdkError::SspSwapFailed)?;
 
         let resp = client.request(req).await.map_err(|e| {
-            eprintln!("[ssp] HTTP request failed: {e:?}");
+            tracing::error!(?e, "SSP HTTP request failed");
             SdkError::SspSwapFailed
         })?;
 
@@ -242,7 +242,7 @@ impl GraphqlSspClient {
             std::str::from_utf8(&body_bytes).map_err(|_| SdkError::SspInvalidResponse)?;
 
         if !status.is_success() {
-            eprintln!("[ssp] HTTP {status}: {body_str}");
+            tracing::error!(%status, body = body_str, "SSP HTTP error response");
             return Err(SdkError::SspSwapFailed);
         }
 
@@ -266,7 +266,7 @@ impl SspClient for GraphqlSspClient {
         let get_challenge_body = format!(
             r#"{{"query":"mutation GetChallenge($input: GetChallengeInput!) {{ get_challenge(input: $input) {{ protected_challenge }} }}","variables":{{"input":{{"public_key":"{identity_pubkey_hex}"}}}}}}"#,
         );
-        eprintln!("[ssp-auth] get_challenge for {identity_pubkey_hex}");
+        tracing::debug!(identity_pubkey_hex, "SSP get_challenge");
 
         let resp_str = self
             .graphql_post(&client, &get_challenge_body, None)
@@ -275,25 +275,25 @@ impl SspClient for GraphqlSspClient {
         // Extract protected_challenge from JSON response.
         let protected_challenge = extract_json_string_field(&resp_str, "protected_challenge")
             .ok_or_else(|| {
-                eprintln!("[ssp-auth] missing protected_challenge in: {resp_str}");
+                tracing::error!(response = resp_str, "SSP missing protected_challenge");
                 SdkError::SspInvalidResponse
             })?;
 
-        eprintln!(
-            "[ssp-auth] got protected_challenge ({} chars)",
-            protected_challenge.len()
+        tracing::debug!(
+            len = protected_challenge.len(),
+            "SSP got protected_challenge"
         );
 
         // Step 2: Base64url-decode the ProtectedChallenge, SHA256-hash
         //         the **full** protobuf bytes, and ECDSA-sign.
         //         (The SSP verifies against SHA256(full_protobuf), not the inner Challenge.)
         let protobuf_bytes = base64url_decode(protected_challenge).ok_or_else(|| {
-            eprintln!("[ssp-auth] failed to base64url-decode protected_challenge");
+            tracing::error!("SSP failed to base64url-decode protected_challenge");
             SdkError::SspInvalidResponse
         })?;
 
         let signature_der = sign_fn(&protobuf_bytes).map_err(|e| {
-            eprintln!("[ssp-auth] sign_challenge failed: {e}");
+            tracing::error!(?e, "SSP sign_challenge failed");
             SdkError::SigningFailed
         })?;
 
@@ -306,17 +306,17 @@ impl SspClient for GraphqlSspClient {
             protected_challenge, signature_b64, identity_pubkey_hex,
         );
 
-        eprintln!("[ssp-auth] verify_challenge body: {verify_body}");
+        tracing::debug!(body = verify_body, "SSP verify_challenge request");
         let verify_resp = self.graphql_post(&client, &verify_body, None).await?;
-        eprintln!("[ssp-auth] verify_challenge response: {verify_resp}");
+        tracing::debug!(response = verify_resp, "SSP verify_challenge response");
 
         let session_token =
             extract_json_string_field(&verify_resp, "session_token").ok_or_else(|| {
-                eprintln!("[ssp-auth] missing session_token in: {verify_resp}");
+                tracing::error!(response = verify_resp, "SSP missing session_token");
                 SdkError::SspInvalidResponse
             })?;
 
-        eprintln!("[ssp-auth] authenticated successfully");
+        tracing::info!("SSP authenticated successfully");
         Ok(session_token.to_owned())
     }
 
@@ -357,13 +357,13 @@ impl SspClient for GraphqlSspClient {
             variables,
         );
 
-        eprintln!("[ssp] request body: {query}");
+        tracing::debug!(body = query, "SSP request_swap request");
 
         let body_str = self
             .graphql_post(&client, &query, Some(&input.auth_token))
             .await?;
 
-        eprintln!("[ssp] response body: {body_str}");
+        tracing::debug!(response = body_str, "SSP request_swap response");
         let spark_id = extract_spark_id(&body_str).ok_or(SdkError::SspInvalidResponse)?;
 
         Ok(RequestSwapResponse {
@@ -376,34 +376,11 @@ impl SspClient for GraphqlSspClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Decode a 33-byte hex-encoded compressed public key.
-fn hex_decode_33(hex: &str) -> Option<[u8; 33]> {
-    if hex.len() != 66 {
-        return None;
-    }
-    let mut out = [0u8; 33];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Standard base64 encode (RFC 4648) with padding.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -570,17 +547,17 @@ mod tests {
     }
 
     #[test]
-    fn hex_decode_33_valid() {
+    fn hex_decode_pubkey_valid() {
         let hex = "02".to_owned() + &"ab".repeat(32);
-        let result = hex_decode_33(&hex);
+        let result = crate::utils::hex_decode_pubkey(&hex);
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 0x02);
         assert_eq!(result.unwrap()[1], 0xab);
     }
 
     #[test]
-    fn hex_decode_33_wrong_length() {
-        assert!(hex_decode_33("0102").is_none());
+    fn hex_decode_pubkey_wrong_length() {
+        assert!(crate::utils::hex_decode_pubkey("0102").is_none());
     }
 
     #[test]

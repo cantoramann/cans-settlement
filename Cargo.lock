@@ -1826,6 +1826,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
+ "tracing",
  "transport",
 ]
 
