@@ -252,7 +252,7 @@ pub fn sign_as_user(
     public_key: &PublicKey,
     verifying_key: &PublicKey,
     nonces: &SigningNonces,
-    all_commitments: BTreeMap<Identifier, SigningCommitments>,
+    all_commitments: &BTreeMap<Identifier, SigningCommitments>,
 ) -> Result<SignatureShare, FrostError> {
     let user_id = user_identifier();
 
@@ -265,8 +265,12 @@ pub fn sign_as_user(
     let user_group = BTreeSet::from([user_id]);
     let groups = vec![operator_group, user_group];
 
-    let signing_package =
-        SigningPackage::new_with_participants_groups(all_commitments, Some(groups), message);
+    // SigningPackage requires ownership; clone once here.
+    let signing_package = SigningPackage::new_with_participants_groups(
+        all_commitments.clone(),
+        Some(groups),
+        message,
+    );
 
     // Deserialize raw key material.
     let signing_share = SigningShare::deserialize(&signing_key.secret_bytes())
