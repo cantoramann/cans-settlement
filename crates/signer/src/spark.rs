@@ -59,8 +59,9 @@ mod tests {
     use bitcoin::secp256k1::Secp256k1;
 
     fn test_keypair() -> SecretKey {
-        let mut rng = rand::thread_rng();
-        SecretKey::new(&mut rng)
+        let mut bytes = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
+        SecretKey::from_slice(&bytes).expect("32 random bytes always valid")
     }
 
     #[test]

@@ -25,11 +25,7 @@ pub fn proto_to_tree_node(node: &spark::TreeNode) -> Option<TreeNode> {
         .unwrap_or([0u8; 33]);
 
     let optional_bytes = |b: &bytes::Bytes| -> Option<Vec<u8>> {
-        if b.is_empty() {
-            None
-        } else {
-            Some(b.to_vec())
-        }
+        if b.is_empty() { None } else { Some(b.to_vec()) }
     };
 
     Some(TreeNode {

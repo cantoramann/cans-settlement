@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn ecies_roundtrip() {
         let signer = make_signer();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let msg = b"secret payload";
         let ct = signer
@@ -390,7 +390,7 @@ mod tests {
     fn ecies_wrong_key_fails() {
         let s1 = make_signer();
         let s2 = SparkWalletSigner::from_seed(SEED, bitcoin::Network::Bitcoin, 1).unwrap();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let ct = s1
             .ecies_encrypt(&s1.identity_pk_uncompressed, b"secret", &mut rng)
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn vss_split_and_validate() {
         let signer = make_signer();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         let secret = [0x42u8; 32];
 
         let shares = signer.vss_split(&secret, 2, 3, &mut rng).unwrap();
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn vss_invalid_threshold_rejected() {
         let signer = make_signer();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         assert!(signer.vss_split(&[0x11; 32], 0, 3, &mut rng).is_err());
         assert!(signer.vss_split(&[0x11; 32], 4, 3, &mut rng).is_err());
     }
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn frost_generate_nonces_succeeds() {
         let signer = make_signer();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let nonce_pair = signer.frost_generate_nonces("test-leaf", &mut rng).unwrap();
 

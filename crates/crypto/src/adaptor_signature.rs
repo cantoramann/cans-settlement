@@ -27,13 +27,13 @@
 use std::fmt;
 
 use bitcoin::hashes::{Hash, HashEngine, sha256};
-use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::secp256k1::{self, Message, PublicKey, Secp256k1, SecretKey, Verification};
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::group::GroupEncoding;
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
 use k256::elliptic_curve::point::{AffineCoordinates, DecompressPoint};
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
+use rand_core::RngCore;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -236,7 +236,9 @@ pub fn generate_adaptor_from_signature(
     let s = parse_scalar(&s_bytes)?;
 
     // Generate a random valid scalar as the adaptor secret
-    let adaptor_sk = SecretKey::new(rng);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let adaptor_sk = SecretKey::from_slice(&sk_bytes).map_err(|_| AdaptorError::InvalidScalar)?;
     let t = parse_scalar(&adaptor_sk.secret_bytes())?;
 
     // s' = s - t
@@ -431,7 +433,7 @@ mod tests {
     #[test]
     fn round_trip_generate_validate_complete() {
         let (secp, _sk, pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         // Step 1: blind the valid signature
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
@@ -468,7 +470,7 @@ mod tests {
     #[test]
     fn extract_without_verification() {
         let (secp, _sk, pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
 
@@ -487,7 +489,7 @@ mod tests {
     #[test]
     fn recover_adaptor_secret_from_signatures() {
         let (_secp, _sk, _pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
 
@@ -538,7 +540,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_pubkey() {
         let (_secp, _sk, _pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
         let adaptor_point = adaptor_public_point(&adaptor.adaptor_secret);
@@ -559,7 +561,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_message() {
         let (_secp, _sk, pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
         let adaptor_point = adaptor_public_point(&adaptor.adaptor_secret);
@@ -577,7 +579,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_adaptor_point() {
         let (_secp, _sk, pk, sig) = setup();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let adaptor = generate_adaptor_from_signature(&sig, &mut rng).unwrap();
 

@@ -252,7 +252,7 @@ pub fn sign_as_user(
     public_key: &PublicKey,
     verifying_key: &PublicKey,
     nonces: &SigningNonces,
-    all_commitments: BTreeMap<Identifier, SigningCommitments>,
+    all_commitments: &BTreeMap<Identifier, SigningCommitments>,
 ) -> Result<SignatureShare, FrostError> {
     let user_id = user_identifier();
 
@@ -265,8 +265,12 @@ pub fn sign_as_user(
     let user_group = BTreeSet::from([user_id]);
     let groups = vec![operator_group, user_group];
 
-    let signing_package =
-        SigningPackage::new_with_participants_groups(all_commitments, Some(groups), message);
+    // SigningPackage requires ownership; clone once here.
+    let signing_package = SigningPackage::new_with_participants_groups(
+        all_commitments.clone(),
+        Some(groups),
+        message,
+    );
 
     // Deserialize raw key material.
     let signing_share = SigningShare::deserialize(&signing_key.secret_bytes())
@@ -484,12 +488,10 @@ mod tests {
 
     #[test]
     fn commitment_roundtrip() {
-        use rand::thread_rng;
-
         let signing_share =
             SigningShare::deserialize(&[1u8; 32]).expect("valid signing share for test");
 
-        let pair = generate_nonces(&signing_share, &mut thread_rng());
+        let pair = generate_nonces(&signing_share, &mut rand_core::OsRng);
         let bytes = serialize_commitment(&pair.commitment).unwrap();
         let recovered = deserialize_commitment(&bytes).unwrap();
 
