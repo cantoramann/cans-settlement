@@ -8,7 +8,8 @@ members = [
     "crates/storage",
     "crates/sdk-core",
     "crates/config",
-    "crates/sdk", "tools/funding-client",
+    "crates/sdk",
+    "tools/funding-client",
 ]
 
 resolver = "2"
@@ -18,27 +19,33 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/polarityorg/sparksdk"
+repository = "https://github.com/flashnetxyz/settlement"
 authors = ["Flashnet <can@flashnet.xyz>"]
 
 [workspace.dependencies]
 # Crypto
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 bech32 = { version = "0.11", default-features = false }
-bitcoin = { version = "0.32.8", default-features = false, features = [
-    "serde",
-    "rand",
+bitcoin = { version = "0.32.8", default-features = false, features = ["serde"] }
+frost-core = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing", default-features = false, features = [
+    "serialization",
 ] }
-frost-core = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing" }
-frost-secp256k1-tr = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing" }
-rand_core = { version = "0.6", default-features = false }
+frost-secp256k1-tr = { git = "https://github.com/lightsparkdev/frost", branch = "nested-signing", default-features = false, features = [
+    "serialization",
+] }
+rand_core = { version = "0.6", default-features = false, features = [
+    "getrandom",
+] }
 spark-crypto = { path = "crates/crypto" }
 k256 = { version = "0.13.4", default-features = false, features = [
     "arithmetic",
 ] }
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }
 
 # Signing
 signer = { path = "crates/signer", default-features = false }
@@ -48,15 +55,13 @@ sdk-core = { path = "crates/sdk-core" }
 
 # gRPC / serialization
 bytes = "1"
-tonic = { version = "0.14.3", features = [
+tonic = { version = "0.14.3", default-features = false, features = [
+    "codegen",
     "tls-ring",
     "tls-native-roots",
     "gzip",
 ] }
 tonic-prost = "0.14.3"
-tonic-prost-build = "0.14.3"
-tonic-build = "0.14.3"
-tonic-reflection = "0.14.3"
 prost = "0.14.3"
 prost-types = "0.14.3"
 

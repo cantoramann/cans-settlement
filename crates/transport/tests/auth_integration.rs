@@ -38,8 +38,9 @@ fn make_transport() -> GrpcTransport {
 
 /// Creates a random [`SparkSigner`] for testing.
 fn random_signer() -> SparkSigner {
-    let mut rng = rand::thread_rng();
-    let sk = SecretKey::new(&mut rng);
+    let mut bytes = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
+    let sk = SecretKey::from_slice(&bytes).expect("32 random bytes always valid");
     SparkSigner::new(sk)
 }
 

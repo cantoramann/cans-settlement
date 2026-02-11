@@ -32,7 +32,7 @@ use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
 
-use verify_decrypt::{verify_and_decrypt_transfer, ClaimableLeaf};
+use verify_decrypt::{ClaimableLeaf, verify_and_decrypt_transfer};
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -162,7 +162,7 @@ where
         let num_operators = self.inner.config.network.num_operators();
         let threshold = self.inner.config.network.threshold;
         let operators = self.inner.config.network.operators();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         // Build per-operator ClaimLeafKeyTweak lists.
         let mut per_operator_tweaks: Vec<Vec<spark::ClaimLeafKeyTweak>> =
@@ -274,7 +274,7 @@ where
         signer: &impl WalletSigner,
     ) -> Result<usize, SdkError> {
         let network = crate::network::bitcoin_network(self.inner.config.network.network);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         // For each leaf: derive new key, generate nonces, construct refund tx, build signing job.
         let mut signing_jobs = Vec::with_capacity(claimable.len());
@@ -421,14 +421,11 @@ where
             .map_err(|_| SdkError::TransportFailed)?;
 
         let mut node_signatures = Vec::with_capacity(leaf_signing_data.len());
-        for (idx, signing_result) in sign_resp.signing_results.iter().enumerate() {
+        for signing_result in &sign_resp.signing_results {
             let ctx = leaf_signing_data
-                .get(idx)
+                .iter()
+                .find(|c| c.leaf_id == signing_result.leaf_id)
                 .ok_or(SdkError::InvalidOperatorResponse)?;
-            debug_assert_eq!(
-                ctx.leaf_id, signing_result.leaf_id,
-                "coordinator result order should match signing job order"
-            );
 
             let cpfp_refund_sig = self
                 .frost_sign_and_aggregate(

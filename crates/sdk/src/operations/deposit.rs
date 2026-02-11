@@ -102,7 +102,7 @@ where
             .map_err(|_| SdkError::TransportFailed)?;
 
         // 2. FROST sign root + refund transactions.
-        let mut _rng = rand::thread_rng();
+        let mut _rng = rand_core::OsRng;
         // (Actual signing depends on the deposit output and node tx structure.)
 
         // 3. Finalize deposit tree creation.

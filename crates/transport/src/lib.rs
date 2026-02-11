@@ -30,27 +30,34 @@ pub mod grpc;
 pub mod session;
 
 // ---------------------------------------------------------------------------
-// gRPC modules (generated from proto definitions)
+// gRPC modules (pre-generated from proto definitions)
+//
+// These files live in src/gen/ and are checked in to version control.
+// To regenerate after proto changes:
+//
+//   cargo run -p transport --features grpc --bin generate-protos
+//
+// Or manually with tonic-prost-build (see proto/README.md).
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "grpc")]
 pub mod common {
-    include!(concat!(env!("OUT_DIR"), "/common.rs"));
+    include!("gen/common.rs");
 }
 
 #[cfg(feature = "grpc")]
 pub mod spark {
-    include!(concat!(env!("OUT_DIR"), "/spark.rs"));
+    include!("gen/spark.rs");
 }
 
 #[cfg(feature = "grpc")]
 pub mod spark_authn {
-    include!(concat!(env!("OUT_DIR"), "/spark_authn.rs"));
+    include!("gen/spark_authn.rs");
 }
 
 #[cfg(feature = "grpc")]
 pub mod spark_token {
-    include!(concat!(env!("OUT_DIR"), "/spark_token.rs"));
+    include!("gen/spark_token.rs");
 }
 
 /// Validation rule types from `validate.proto`.
@@ -61,5 +68,5 @@ pub mod spark_token {
 #[cfg(feature = "grpc")]
 #[allow(clippy::len_without_is_empty)]
 pub mod validate {
-    include!(concat!(env!("OUT_DIR"), "/validate.rs"));
+    include!("gen/validate.rs");
 }

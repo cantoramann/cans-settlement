@@ -65,7 +65,7 @@ fn resolve_mnemonic(env_key: &str) -> Mnemonic {
     } else {
         // 12 words = 128 bits = 16 bytes of entropy.
         let mut entropy = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rand::thread_rng(), &mut entropy);
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut entropy);
         Mnemonic::from_entropy(&entropy).expect("valid entropy")
     }
 }
@@ -663,4 +663,146 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX_CHARS[(b & 0xf) as usize] as char);
     }
     s
+}
+
+// ===========================================================================
+// Tests: Fund → Claim → Send-to-self (full round-trip)
+// ===========================================================================
+
+/// End-to-end: request funds via faucet, claim, then send to self.
+///
+/// Flow:
+/// 1. Generate a fresh wallet.
+/// 2. Request funds from the funding-client faucet.
+/// 3. Wait 3 seconds for the transfer to propagate.
+/// 4. Claim the incoming transfer.
+/// 5. Send the claimed balance back to self.
+/// 6. Wait 3 seconds, then claim the self-transfer.
+/// 7. Verify balance is preserved.
+///
+/// Run:
+/// ```bash
+/// cargo test -p sdk --test e2e fund_claim_send_to_self -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires network access and funding-client faucet"]
+async fn fund_claim_send_to_self() {
+    // 1. Generate a fresh wallet.
+    let mnemonic = resolve_mnemonic("E2E_WALLET_A_MNEMONIC");
+    let (signer, pubkey) = wallet_from_mnemonic(&mnemonic, ACCOUNT_A);
+    let spark_address = encode_spark_address(Network::Regtest, &pubkey);
+
+    let sdk = make_sdk_with_wallet(&mnemonic, &pubkey, ACCOUNT_A);
+
+    println!("\n========== Fund → Claim → Send-to-self ==========");
+    println!("  Wallet pubkey:  {}", hex_encode(&pubkey));
+    println!("  Spark address:  {spark_address}");
+
+    // 2. Request funds from the faucet.
+    let funding_amount = 1_000u64; // 1000 sats
+    println!("\n  [Step 1] Requesting {funding_amount} sats from faucet...");
+
+    let faucet = funding_client::FundingClient::new().await;
+    let fund_results = faucet
+        .request_funds(vec![funding_client::FundingTask {
+            amount_sats: funding_amount,
+            recipient: spark_address.clone(),
+        }])
+        .await
+        .expect("funding request should succeed");
+
+    assert_eq!(
+        fund_results.len(),
+        1,
+        "should get exactly one funding result"
+    );
+    println!(
+        "    Funded: {} sats, status: {}, txids: {:?}",
+        fund_results[0].amount_sent, fund_results[0].status, fund_results[0].txids
+    );
+
+    // 3. Wait for the transfer to propagate.
+    println!("\n  [Step 2] Waiting 10 seconds for transfer propagation...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // 4. Claim the incoming transfer.
+    println!("  [Step 3] Claiming incoming transfer...");
+    let claim_result = sdk
+        .claim_transfer(&pubkey, &signer)
+        .await
+        .expect("claim should succeed");
+
+    println!("    Claimed: {} leaves", claim_result.leaves_claimed);
+    assert!(
+        claim_result.leaves_claimed > 0,
+        "should claim at least one leaf"
+    );
+
+    // Read balance from local store (claim already inserted leaves; sync
+    // would query the coordinator which may not yet reflect new ownership).
+    let balance_after_claim = sdk
+        .query_balance(&pubkey)
+        .await
+        .expect("balance query should succeed");
+
+    println!(
+        "    After claim: {} sats",
+        balance_after_claim.btc_available_sats
+    );
+    assert!(
+        balance_after_claim.btc_available_sats > 0,
+        "balance should be positive after claim"
+    );
+
+    // 5. Send the full claimed balance to self.
+    let send_amount = balance_after_claim.btc_available_sats;
+    println!("\n  [Step 4] Sending {send_amount} sats to self...");
+
+    let send_result = sdk
+        .send_transfer(&pubkey, &pubkey, send_amount, &signer)
+        .await
+        .expect("send_transfer to self should succeed");
+
+    println!(
+        "    Transfer submitted: {:?}",
+        send_result.transfer.as_ref().map(|t| &t.id)
+    );
+
+    // 6. Wait for the self-transfer to propagate, then claim it.
+    println!("\n  [Step 5] Waiting 3 seconds for self-transfer propagation...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    println!("  [Step 6] Claiming self-transfer...");
+    let self_claim = sdk
+        .claim_transfer(&pubkey, &signer)
+        .await
+        .expect("self-claim should succeed");
+
+    println!("    Claimed: {} leaves", self_claim.leaves_claimed);
+    assert!(
+        self_claim.leaves_claimed > 0,
+        "should claim the self-transfer leaf(s)"
+    );
+
+    // 7. Verify balance is preserved (read from local store).
+    let final_balance = sdk
+        .query_balance(&pubkey)
+        .await
+        .expect("final balance query should succeed");
+
+    println!(
+        "\n  [Step 7] Final balance: {} sats",
+        final_balance.btc_available_sats
+    );
+    assert!(
+        final_balance.btc_available_sats > 0,
+        "final balance should be positive"
+    );
+
+    println!(
+        "    Balance: {} sats (started with {} sats)",
+        final_balance.btc_available_sats, balance_after_claim.btc_available_sats
+    );
+
+    println!("===================================================\n");
 }

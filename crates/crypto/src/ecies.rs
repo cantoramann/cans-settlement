@@ -21,7 +21,7 @@
 //! let sk = SecretKey::from_slice(&[0xcd; 32]).unwrap();
 //! let pk = PublicKey::from_secret_key(&secp, &sk);
 //!
-//! let mut rng = rand::thread_rng();
+//! let mut rng = rand_core::OsRng;
 //! let ciphertext = ecies::encrypt(
 //!     &secp,
 //!     &pk.serialize_uncompressed(),
@@ -40,8 +40,8 @@ use aes_gcm::aead::generic_array::typenum::U16;
 use aes_gcm::aes::Aes256;
 use aes_gcm::{AesGcm, KeyInit};
 use bitcoin::hashes::{Hash, HashEngine, hmac, sha256};
-use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification};
+use rand_core::RngCore;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -456,7 +456,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0xcd; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let msg = b"hello world";
         let ct = encrypt(&secp, &pk.serialize_uncompressed(), msg, &mut rng).unwrap();
@@ -469,7 +469,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0xab; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let msg = b"compressed receiver key test";
         let ct = encrypt(&secp, &pk.serialize(), msg, &mut rng).unwrap();
@@ -482,7 +482,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0xef; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         let config = Config {
             ephemeral_key_compressed: true,
             hkdf_key_compressed: true,
@@ -500,7 +500,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let ct = encrypt(&secp, &pk.serialize_uncompressed(), b"", &mut rng).unwrap();
         let pt = decrypt(&secp, &sk[..], &ct).unwrap();
@@ -512,7 +512,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0x22; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let msg = vec![0xFFu8; 64 * 1024];
         let ct = encrypt(&secp, &pk.serialize_uncompressed(), &msg, &mut rng).unwrap();
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn encrypt_invalid_public_key() {
         let secp = Secp256k1::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         assert_eq!(
             encrypt(&secp, &[0u8; 33], b"msg", &mut rng),
             Err(EciesError::InvalidPublicKey)
@@ -557,7 +557,7 @@ mod tests {
         let sk1 = SecretKey::from_slice(&[0xaa; 32]).unwrap();
         let pk1 = PublicKey::from_secret_key(&secp, &sk1);
         let sk2 = SecretKey::from_slice(&[0xbb; 32]).unwrap();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let ct = encrypt(&secp, &pk1.serialize_uncompressed(), b"secret", &mut rng).unwrap();
         assert_eq!(
@@ -571,7 +571,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0xcc; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let mut ct = encrypt(
             &secp,
@@ -595,7 +595,7 @@ mod tests {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[0xcd; 32]).unwrap();
         let pk = PublicKey::from_secret_key(&secp, &sk);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         let msg = b"our encrypt, ecies crate decrypt";
         let ct = encrypt(&secp, &pk.serialize_uncompressed(), msg, &mut rng).unwrap();

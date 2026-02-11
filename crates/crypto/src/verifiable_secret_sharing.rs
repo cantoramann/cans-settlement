@@ -8,12 +8,12 @@
 //! # Example
 //!
 //! ```
-//! use bitcoin::secp256k1::rand::RngCore;
+//! use rand_core::{OsRng, RngCore};
 //! use k256::{Scalar, elliptic_curve::PrimeField};
 //! use spark_crypto::verifiable_secret_sharing::*;
 //!
 //! let secret = scalar_from_bytes(&[0x42; 32]).unwrap();
-//! let mut rng = bitcoin::secp256k1::rand::thread_rng();
+//! let mut rng = OsRng;
 //! let shares = split_secret_with_proofs(&secret, 3, 5, &mut rng).unwrap();
 //!
 //! for share in &shares {
@@ -27,10 +27,10 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use bitcoin::secp256k1::rand::RngCore;
 use k256::{
     AffinePoint, FieldBytes, ProjectivePoint, PublicKey, Scalar, elliptic_curve::PrimeField,
 };
+use rand_core::RngCore;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -394,8 +394,8 @@ mod tests {
     use super::*;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
 
-    fn test_rng() -> rand::rngs::ThreadRng {
-        rand::thread_rng()
+    fn test_rng() -> rand_core::OsRng {
+        rand_core::OsRng
     }
 
     // -- scalar_from_bytes / scalar_to_bytes --

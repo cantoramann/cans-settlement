@@ -488,12 +488,10 @@ mod tests {
 
     #[test]
     fn commitment_roundtrip() {
-        use rand::thread_rng;
-
         let signing_share =
             SigningShare::deserialize(&[1u8; 32]).expect("valid signing share for test");
 
-        let pair = generate_nonces(&signing_share, &mut thread_rng());
+        let pair = generate_nonces(&signing_share, &mut rand_core::OsRng);
         let bytes = serialize_commitment(&pair.commitment).unwrap();
         let recovered = deserialize_commitment(&bytes).unwrap();
 

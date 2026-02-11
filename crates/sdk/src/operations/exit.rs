@@ -65,7 +65,7 @@ where
             .map_err(|_| SdkError::TransportFailed)?;
 
         // 3. FROST sign connector refund transactions.
-        let mut _rng = rand::thread_rng();
+        let mut _rng = rand_core::OsRng;
         // (Actual signing depends on connector tx structure.)
 
         // 4. Finalize with transfer package.

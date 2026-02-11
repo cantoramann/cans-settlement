@@ -81,7 +81,7 @@ where
             .map_err(|_| SdkError::TransportFailed)?;
 
         // 3-4. FROST sign HTLC-style refunds.
-        let mut _rng = rand::thread_rng();
+        let mut _rng = rand_core::OsRng;
         // (Actual signing depends on HTLC script structure.)
 
         // 5. Submit preimage swap.
@@ -117,7 +117,7 @@ where
         let authed = self.authenticate(signer).await?;
 
         // 1. Generate random preimage.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         let mut preimage = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rng, &mut preimage);
 

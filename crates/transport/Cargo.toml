@@ -24,12 +24,9 @@ prost-types = { workspace = true, optional = true }
 tokio = { workspace = true }
 bitcoin = { workspace = true }
 signer = { path = "../signer" }
-rand = "0.8"
-
-[build-dependencies]
-tonic-prost-build = { workspace = true, optional = true }
+rand_core = { workspace = true }
 
 [features]
 default = ["grpc"]
-grpc = ["dep:signer", "dep:bytes", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build"]
+grpc = ["dep:signer", "dep:bytes", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types"]
 mock = []

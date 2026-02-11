@@ -41,6 +41,7 @@ use crate::bitcoin_tx::{
     taproot_sighash,
 };
 use crate::frost_bridge::commitment_to_proto;
+use crate::network::bitcoin_network;
 use crate::tree::{TreeStore, select_leaves_greedy};
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
@@ -185,7 +186,7 @@ where
         let num_operators = self.inner.config.network.num_operators();
         let threshold = self.inner.config.network.threshold;
         let operators = self.inner.config.network.operators();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
 
         // 2. Prepare per-leaf send contexts: ephemeral key, tweaks, refund txs, nonces.
         let mut leaf_contexts: Vec<LeafSendContext> = Vec::with_capacity(reservation.leaves.len());
@@ -196,7 +197,10 @@ where
                 .map_err(|_| SdkError::SigningFailed)?;
 
             // Generate random ephemeral keypair.
-            let ephemeral_sk = SecretKey::new(&mut rng);
+            let mut eph_bytes = [0u8; 32];
+            rand_core::RngCore::fill_bytes(&mut rng, &mut eph_bytes);
+            let ephemeral_sk =
+                SecretKey::from_slice(&eph_bytes).expect("32 random bytes always valid");
             let ephemeral_pk = PublicKey::from_secret_key(&secp, &ephemeral_sk);
 
             // Compute key tweak: current - ephemeral.
@@ -223,8 +227,10 @@ where
                 let share_sk =
                     SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
                 let share_pk = PublicKey::from_secret_key(&secp, &share_sk);
-                pubkey_shares_tweak
-                    .insert(operators[i].id.to_string(), Bytes::copy_from_slice(&share_pk.serialize()));
+                pubkey_shares_tweak.insert(
+                    operators[i].id.to_string(),
+                    Bytes::copy_from_slice(&share_pk.serialize()),
+                );
             }
 
             // Build per-operator tweak data.
@@ -257,9 +263,11 @@ where
                 .ecies_encrypt(receiver_pubkey, &ephemeral_sk.secret_bytes(), &mut rng)
                 .map_err(|_| SdkError::SigningFailed)?;
 
-            // Build refund transactions paying to ephemeral pubkey.
-            let ephemeral_xonly =
-                compressed_to_xonly(&ephemeral_pk.serialize()).ok_or(SdkError::SigningFailed)?;
+            // Build refund transactions paying to receiver's identity key.
+            // Refunds must be claimable by the receiver even if they never learn
+            // the ephemeral key, so the output key is the receiver's public key.
+            let receiver_xonly =
+                compressed_to_xonly(receiver_pubkey).ok_or(SdkError::SigningFailed)?;
 
             let node_tx = parse_tx(&leaf.node_tx).map_err(|_| SdkError::InvalidRequest)?;
             let prev_out = node_tx
@@ -269,16 +277,20 @@ where
                 .clone();
             let node_txid = node_tx.compute_txid();
 
-            // Extract sequences from existing refund txs.
-            let cpfp_seq = extract_sequence(leaf.refund_tx.as_deref());
-            let direct_from_cpfp_seq = extract_sequence(leaf.direct_from_cpfp_refund_tx.as_deref());
+            // Extract sequences from existing refund txs and compute next
+            // (decremented) sequences for the send. Each transfer decrements
+            // the CPFP timelock by TIME_LOCK_INTERVAL (100). Direct sequences
+            // are CPFP + DIRECT_TIME_LOCK_OFFSET (50).
+            let old_cpfp_seq = extract_sequence(leaf.refund_tx.as_deref());
+            let (next_cpfp_seq, next_direct_seq) =
+                next_send_sequence(old_cpfp_seq).ok_or(SdkError::InvalidRequest)?;
 
             let cpfp_refund_tx = create_cpfp_refund_tx(
                 node_txid,
                 leaf.vout,
                 prev_out.value,
-                cpfp_seq,
-                &ephemeral_xonly,
+                next_cpfp_seq,
+                &receiver_xonly,
                 network,
             );
 
@@ -286,17 +298,16 @@ where
                 node_txid,
                 leaf.vout,
                 prev_out.value,
-                direct_from_cpfp_seq,
-                &ephemeral_xonly,
+                next_direct_seq,
+                &receiver_xonly,
                 network,
             );
 
             // Direct refund tx (if direct_tx exists on the leaf).
-            let direct_seq = extract_sequence(leaf.direct_refund_tx.as_deref());
-            let (direct_refund_tx, direct_prev_out) = if let Some(ref direct_tx_raw) = leaf.direct_tx
+            let (direct_refund_tx, direct_prev_out) = if let Some(ref direct_tx_raw) =
+                leaf.direct_tx
             {
-                let direct_tx =
-                    parse_tx(direct_tx_raw).map_err(|_| SdkError::InvalidRequest)?;
+                let direct_tx = parse_tx(direct_tx_raw).map_err(|_| SdkError::InvalidRequest)?;
                 let dpo = direct_tx
                     .output
                     .first()
@@ -306,8 +317,8 @@ where
                     direct_tx.compute_txid(),
                     0,
                     dpo.value,
-                    direct_seq,
-                    &ephemeral_xonly,
+                    next_direct_seq,
+                    &receiver_xonly,
                     network,
                 );
                 (Some(dtx), Some(dpo))
@@ -320,12 +331,14 @@ where
                 spark_crypto::frost::deserialize_signing_share(&current_sk.secret_bytes())
                     .map_err(|_| SdkError::SigningFailed)?;
 
-            let cpfp_nonce_pair =
-                spark_crypto::frost::generate_nonces(&signing_share, &mut rng);
+            let cpfp_nonce_pair = spark_crypto::frost::generate_nonces(&signing_share, &mut rng);
             let direct_from_cpfp_nonce_pair =
                 spark_crypto::frost::generate_nonces(&signing_share, &mut rng);
             let direct_nonce_pair = if direct_refund_tx.is_some() {
-                Some(spark_crypto::frost::generate_nonces(&signing_share, &mut rng))
+                Some(spark_crypto::frost::generate_nonces(
+                    &signing_share,
+                    &mut rng,
+                ))
             } else {
                 None
             };
@@ -404,25 +417,32 @@ where
                 signing_nonce_commitment: Some(cpfp_user_commitment),
                 user_signature: Bytes::copy_from_slice(&cpfp_sig),
                 signing_commitments: Some(spark::SigningCommitments {
-                    signing_commitments: cpfp_op_commitments
-                        .signing_nonce_commitments
-                        .clone(),
+                    signing_commitments: cpfp_op_commitments.signing_nonce_commitments.clone(),
                 }),
             });
 
             // Direct refund: commitment at index (1 * n_leaves + leaf_idx).
             let direct_commitment_idx = n_leaves + leaf_idx;
-            if let (Some(dtx), Some(dnp), Some(dpo)) =
-                (&ctx.direct_refund_tx, &ctx.direct_nonce_pair, &ctx.direct_prev_out)
-            {
+            if let (Some(dtx), Some(dnp), Some(dpo)) = (
+                &ctx.direct_refund_tx,
+                &ctx.direct_nonce_pair,
+                &ctx.direct_prev_out,
+            ) {
                 let direct_op_commitments = commitments
                     .get(direct_commitment_idx)
                     .ok_or(SdkError::InvalidOperatorResponse)?;
-                let direct_user_commitment = commitment_to_proto(&dnp.commitment)
-                    .map_err(|_| SdkError::SigningFailed)?;
+                let direct_user_commitment =
+                    commitment_to_proto(&dnp.commitment).map_err(|_| SdkError::SigningFailed)?;
 
                 let direct_sig = self
-                    .frost_sign_and_aggregate_send(ctx, dtx, dnp, direct_op_commitments, dpo, signer)
+                    .frost_sign_and_aggregate_send(
+                        ctx,
+                        dtx,
+                        dnp,
+                        direct_op_commitments,
+                        dpo,
+                        signer,
+                    )
                     .await?;
 
                 direct_jobs.push(spark::UserSignedTxSigningJob {
@@ -466,21 +486,16 @@ where
                 signing_nonce_commitment: Some(dfcpfp_user_commitment),
                 user_signature: Bytes::copy_from_slice(&dfcpfp_sig),
                 signing_commitments: Some(spark::SigningCommitments {
-                    signing_commitments: dfcpfp_op_commitments
-                        .signing_nonce_commitments
-                        .clone(),
+                    signing_commitments: dfcpfp_op_commitments.signing_nonce_commitments.clone(),
                 }),
             });
         }
 
         // 5. Build key_tweak_package: operator_id -> ECIES(operator_pk, SendLeafTweaks).
-        //    The transfer_id is not known yet (coordinator assigns it), so we use
-        //    an empty string for the ECDSA signature payload initially. The
-        //    coordinator will populate transfer_id in the response.
-        //    For the signature over SHA256(leaf_id||transfer_id||secret_cipher),
-        //    we leave transfer_id empty -- the coordinator accepts this for the
-        //    TransferPackage flow where the transfer_id is assigned server-side.
-        let transfer_id_bytes = b""; // Coordinator assigns transfer_id.
+        //    Generate transfer_id (UUIDv4) client-side: the coordinator requires
+        //    a valid UUID and the ECDSA signature signs over leaf_id||transfer_id||secret_cipher.
+        let transfer_id = generate_uuid_v4(&mut rng);
+        let transfer_id_bytes = transfer_id.as_bytes();
 
         let mut key_tweak_package: HashMap<String, Bytes> = HashMap::new();
 
@@ -496,8 +511,7 @@ where
                 sig_payload.extend_from_slice(&ctx.secret_cipher);
 
                 let payload_hash = bitcoin::hashes::sha256::Hash::hash(&sig_payload);
-                let sig_compact =
-                    signer.sign_ecdsa_digest_compact(payload_hash.as_byte_array());
+                let sig_compact = signer.sign_ecdsa_digest_compact(payload_hash.as_byte_array());
 
                 let op_tweak = &ctx.per_operator_tweaks[op_idx];
 
@@ -529,17 +543,22 @@ where
             key_tweak_package.insert(op.id.to_string(), Bytes::from(encrypted));
         }
 
-        // 6. Sign the transfer package (user_signature over package hash).
-        //    Build the signing payload: concatenation of all refund tx bytes in order.
-        let mut package_payload = Vec::new();
-        for job in &cpfp_jobs {
-            package_payload.extend_from_slice(&job.raw_tx);
-        }
-        for job in &direct_jobs {
-            package_payload.extend_from_slice(&job.raw_tx);
-        }
-        for job in &direct_from_cpfp_jobs {
-            package_payload.extend_from_slice(&job.raw_tx);
+        // 6. Sign the transfer package (user_signature).
+        //    Payload = hex_decode(transfer_id without dashes)
+        //            + for each (key, value) in key_tweak_package sorted by key:
+        //                key_bytes + b":" + value_bytes + b";"
+        let transfer_id_hex = transfer_id.replace('-', "");
+        let transfer_id_raw = hex_decode_bytes(&transfer_id_hex).ok_or(SdkError::InvalidRequest)?;
+
+        let mut pairs: Vec<(&String, &Bytes)> = key_tweak_package.iter().collect();
+        pairs.sort_by_key(|(k, _)| (*k).clone());
+
+        let mut package_payload = transfer_id_raw;
+        for (key, value) in pairs {
+            package_payload.extend_from_slice(key.as_bytes());
+            package_payload.extend_from_slice(b":");
+            package_payload.extend_from_slice(value);
+            package_payload.extend_from_slice(b";");
         }
         let package_sig = signer.sign_ecdsa_message(&package_payload);
 
@@ -550,7 +569,7 @@ where
             direct_from_cpfp_leaves_to_send: direct_from_cpfp_jobs,
             key_tweak_package,
             user_signature: Bytes::from(package_sig),
-            hash_variant: spark::HashVariant::V2 as i32,
+            hash_variant: spark::HashVariant::Unspecified as i32,
         };
 
         // 8. Build and submit StartTransferRequest.
@@ -567,7 +586,7 @@ where
 
         let transfer_resp = authed
             .start_transfer_v2(spark::StartTransferRequest {
-                transfer_id: String::new(), // Coordinator assigns.
+                transfer_id: transfer_id.clone(),
                 owner_identity_public_key: Bytes::copy_from_slice(sender_pubkey),
                 receiver_identity_public_key: Bytes::copy_from_slice(receiver_pubkey),
                 transfer_package: Some(transfer_package),
@@ -629,7 +648,7 @@ where
             &ctx.current_pk,
             &verifying_key,
             &nonce_pair.nonces,
-            all_commitments.clone(),
+            &all_commitments,
         )
         .map_err(|_| SdkError::SigningFailed)?;
 
@@ -659,6 +678,43 @@ fn extract_sequence(raw: Option<&[u8]>) -> bitcoin::Sequence {
         .unwrap_or(bitcoin::Sequence::from_consensus(2000))
 }
 
+// Spark timelock constants (matching Breez SDK / coordinator expectations).
+const TIMELOCK_MASK: u32 = 0x0000_FFFF;
+const TIME_LOCK_INTERVAL: u16 = 100;
+const DIRECT_TIME_LOCK_OFFSET: u16 = 50;
+
+/// Compute the next (decremented) sequences for a send transfer.
+///
+/// Returns `(cpfp_sequence, direct_sequence)`.
+/// Returns `None` if the timelock is already too low to decrement.
+fn next_send_sequence(
+    current_cpfp_seq: bitcoin::Sequence,
+) -> Option<(bitcoin::Sequence, bitcoin::Sequence)> {
+    let raw = current_cpfp_seq.to_consensus_u32();
+    let timelock = (raw & TIMELOCK_MASK) as u16;
+    let next_timelock = timelock.checked_sub(TIME_LOCK_INTERVAL)?;
+    let flags = raw & !TIMELOCK_MASK; // Preserve upper flag bits (e.g. SPARK_SEQUENCE_FLAG).
+    let cpfp = bitcoin::Sequence::from_consensus(flags | u32::from(next_timelock));
+    let direct = bitcoin::Sequence::from_consensus(
+        flags | u32::from(next_timelock + DIRECT_TIME_LOCK_OFFSET),
+    );
+    Some((cpfp, direct))
+}
+
+/// Decode an arbitrary hex string to bytes.
+fn hex_decode_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
 /// Decode a hex-encoded compressed public key (66 hex chars) to 33 bytes.
 fn hex_decode_pubkey(hex: &str) -> Option<[u8; 33]> {
     if hex.len() != 66 {
@@ -682,10 +738,22 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Map `sdk_core::Network` to `bitcoin::Network`.
-fn bitcoin_network(network: sdk_core::Network) -> bitcoin::Network {
-    match network {
-        sdk_core::Network::Mainnet => bitcoin::Network::Bitcoin,
-        sdk_core::Network::Regtest => bitcoin::Network::Regtest,
-    }
+/// Generate a UUIDv4 string from random bytes (no external crate needed).
+fn generate_uuid_v4<R: rand_core::RngCore>(rng: &mut R) -> String {
+    let mut bytes = [0u8; 16];
+    rng.fill_bytes(&mut bytes);
+    // Set version (4) and variant (RFC 4122).
+    bytes[6] = (bytes[6] & 0x0F) | 0x40; // Version 4
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variant 10xx
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        // Last 6 bytes as a single u64 (only lower 48 bits used).
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ]),
+    )
 }
