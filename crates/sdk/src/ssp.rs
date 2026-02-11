@@ -1,14 +1,13 @@
-//! Spark Service Provider (SSP) client trait and types.
+//! SSP client trait, types, and bridge to the `graphql` transport crate.
 //!
-//! The SSP provides swap services: the user sends oversized leaves and
-//! receives back leaves with exact target denominations.  Communication
-//! is via a GraphQL API (not gRPC).
+//! The SDK defines the [`SspClient`] trait for SSP communication. The
+//! concrete GraphQL implementation lives in `crates/graphql` to keep
+//! transport concerns out of the SDK. This module provides:
 //!
-//! # Architecture
-//!
-//! [`SspClient`] is a trait so callers can swap in a mock for testing.
-//! [`GraphqlSspClient`] is the concrete implementation that speaks
-//! GraphQL over HTTPS using hyper (already in the dep tree via tonic).
+//! - [`SspClient`] trait
+//! - Request/response types
+//! - [`NoSspClient`] (no-op stub)
+//! - [`SspClient`] implementation for [`graphql::GraphqlSspClient`]
 
 use bitcoin::secp256k1::PublicKey;
 
@@ -76,19 +75,13 @@ pub type SignChallengeFn<'a> =
 
 /// Trait for SSP communication.
 ///
-/// Implementors speak the SSP GraphQL protocol.  The trait is object-safe
-/// only via `async_trait`-style desugaring; for the generic approach used
-/// here we require `Send + Sync` bounds.
+/// Implementors handle authentication and swap requests. The SDK
+/// orchestrates the transfer/claim protocol on top of this.
 pub trait SspClient: Send + Sync {
     /// Returns the SSP's identity public key.
     fn identity_public_key(&self) -> PublicKey;
 
     /// Authenticates with the SSP and returns a session token.
-    ///
-    /// The flow is challenge-response:
-    /// 1. `get_challenge(public_key)` -> `protected_challenge`
-    /// 2. Decode challenge, sign with `sign_fn`
-    /// 3. `verify_challenge(protected_challenge, signature, public_key)` -> `session_token`
     fn authenticate(
         &self,
         identity_pubkey_hex: &str,
@@ -96,12 +89,6 @@ pub trait SspClient: Send + Sync {
     ) -> impl std::future::Future<Output = Result<String, SdkError>> + Send;
 
     /// Requests a leaf swap from the SSP.
-    ///
-    /// The SSP receives the user's leaves (via the outbound transfer
-    /// already initiated on the coordinator) and sends back new leaves
-    /// matching `target_amount_sats` via an inbound transfer.
-    ///
-    /// `input.auth_token` must be a valid session token from [`Self::authenticate`].
     fn request_swap(
         &self,
         input: RequestSwapInput,
@@ -109,7 +96,7 @@ pub trait SspClient: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// No-op implementation (for SDK users who don't need SSP swaps)
+// No-op implementation
 // ---------------------------------------------------------------------------
 
 /// A no-op SSP client that always returns an error.
@@ -121,7 +108,6 @@ pub struct NoSspClient;
 impl SspClient for NoSspClient {
     fn identity_public_key(&self) -> PublicKey {
         // Dummy key -- never used because request_swap always errors.
-        // This is the generator point; any valid pubkey works here.
         PublicKey::from_slice(&[
             0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE,
             0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81,
@@ -147,114 +133,12 @@ impl SspClient for NoSspClient {
 }
 
 // ---------------------------------------------------------------------------
-// GraphQL implementation (hyper-based)
+// Bridge: graphql::GraphqlSspClient -> SspClient
 // ---------------------------------------------------------------------------
 
-/// SSP client backed by the SSP GraphQL API.
-///
-/// Uses hyper (from the tonic dep tree) for HTTPS, avoiding any new
-/// dependencies.  The GraphQL schema endpoint and identity public key
-/// come from [`config::SspConfig`].
-pub struct GraphqlSspClient {
-    /// Full URL for GraphQL requests (e.g. `https://api.lightspark.com/graphql/spark/rc`).
-    url: String,
-    /// SSP identity public key.
-    identity_pk: PublicKey,
-}
-
-impl GraphqlSspClient {
-    /// Creates a new client from an [`SspConfig`](config::SspConfig).
-    pub fn from_config(ssp: &config::SspConfig) -> Result<Self, SdkError> {
-        let url = format!("{}/{}", ssp.base_url, ssp.schema_endpoint);
-
-        let pk_bytes = crate::utils::hex_decode_pubkey(ssp.identity_public_key)
-            .ok_or(SdkError::InvalidRequest)?;
-        let identity_pk = PublicKey::from_slice(&pk_bytes).map_err(|_| SdkError::InvalidRequest)?;
-
-        Ok(Self { url, identity_pk })
-    }
-
-    /// Build a TLS-enabled hyper client.  Reused by `authenticate` and `request_swap`.
-    fn make_https_client(
-        &self,
-    ) -> Result<
-        hyper_util::client::legacy::Client<
-            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-            http_body_util::Full<hyper::body::Bytes>,
-        >,
-        SdkError,
-    > {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|_| SdkError::SspSwapFailed)?
-            .https_or_http()
-            .enable_http2()
-            .build();
-
-        Ok(
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(https),
-        )
-    }
-
-    /// Send a GraphQL POST and return the response body as a string.
-    ///
-    /// Takes `body_json` by value to avoid re-allocating the request string.
-    async fn graphql_post(
-        &self,
-        client: &hyper_util::client::legacy::Client<
-            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-            http_body_util::Full<hyper::body::Bytes>,
-        >,
-        body_json: String,
-        auth_token: Option<&str>,
-    ) -> Result<String, SdkError> {
-        let body = hyper::body::Bytes::from(body_json);
-
-        let mut builder = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(&self.url)
-            .header("content-type", "application/json");
-
-        if let Some(token) = auth_token {
-            builder = builder.header("authorization", format!("Bearer {token}"));
-        }
-
-        let req = builder
-            .body(http_body_util::Full::new(body))
-            .map_err(|_| SdkError::SspSwapFailed)?;
-
-        let resp = client.request(req).await.map_err(|e| {
-            tracing::error!(?e, "SSP HTTP request failed");
-            SdkError::SspSwapFailed
-        })?;
-
-        let status = resp.status();
-        use http_body_util::BodyExt;
-        let body_bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|_| SdkError::SspSwapFailed)?
-            .to_bytes();
-
-        let body_str =
-            std::str::from_utf8(&body_bytes).map_err(|_| SdkError::SspInvalidResponse)?;
-
-        if !status.is_success() {
-            tracing::error!(%status, body = body_str, "SSP HTTP error response");
-            return Err(SdkError::SspSwapFailed);
-        }
-
-        Ok(body_str.to_owned())
-    }
-}
-
-impl SspClient for GraphqlSspClient {
+impl SspClient for graphql::GraphqlSspClient {
     fn identity_public_key(&self) -> PublicKey {
-        self.identity_pk
+        self.identity_public_key()
     }
 
     async fn authenticate(
@@ -262,329 +146,37 @@ impl SspClient for GraphqlSspClient {
         identity_pubkey_hex: &str,
         sign_fn: SignChallengeFn<'_>,
     ) -> Result<String, SdkError> {
-        let client = self.make_https_client()?;
-
-        // Step 1: get_challenge
-        let get_challenge_body = format!(
-            r#"{{"query":"mutation GetChallenge($input: GetChallengeInput!) {{ get_challenge(input: $input) {{ protected_challenge }} }}","variables":{{"input":{{"public_key":"{identity_pubkey_hex}"}}}}}}"#,
-        );
-        tracing::debug!(identity_pubkey_hex, "SSP get_challenge");
-
-        let resp_str = self.graphql_post(&client, get_challenge_body, None).await?;
-
-        // Extract protected_challenge from JSON response.
-        let protected_challenge = extract_json_string_field(&resp_str, "protected_challenge")
-            .ok_or_else(|| {
-                tracing::error!(response = resp_str, "SSP missing protected_challenge");
-                SdkError::SspInvalidResponse
-            })?;
-
-        tracing::debug!(
-            len = protected_challenge.len(),
-            "SSP got protected_challenge"
-        );
-
-        // Step 2: Base64url-decode the ProtectedChallenge, SHA256-hash
-        //         the **full** protobuf bytes, and ECDSA-sign.
-        //         (The SSP verifies against SHA256(full_protobuf), not the inner Challenge.)
-        let protobuf_bytes = base64url_decode(protected_challenge).ok_or_else(|| {
-            tracing::error!("SSP failed to base64url-decode protected_challenge");
-            SdkError::SspInvalidResponse
-        })?;
-
-        let signature_der = sign_fn(&protobuf_bytes).map_err(|e| {
-            tracing::error!(?e, "SSP sign_challenge failed");
-            SdkError::SigningFailed
-        })?;
-
-        // The SSP expects the signature as standard base64-encoded DER.
-        let signature_b64 = base64_encode(&signature_der);
-
-        // Step 3: verify_challenge
-        let verify_body = format!(
-            r#"{{"query":"mutation VerifyChallenge($input: VerifyChallengeInput!) {{ verify_challenge(input: $input) {{ session_token }} }}","variables":{{"input":{{"protected_challenge":"{}","signature":"{}","identity_public_key":"{}"}}}}}}"#,
-            protected_challenge, signature_b64, identity_pubkey_hex,
-        );
-
-        tracing::debug!(body = %verify_body, "SSP verify_challenge request");
-        let verify_resp = self.graphql_post(&client, verify_body, None).await?;
-        tracing::debug!(response = verify_resp, "SSP verify_challenge response");
-
-        let session_token =
-            extract_json_string_field(&verify_resp, "session_token").ok_or_else(|| {
-                tracing::error!(response = verify_resp, "SSP missing session_token");
-                SdkError::SspInvalidResponse
-            })?;
-
-        tracing::info!("SSP authenticated successfully");
-        Ok(session_token.to_owned())
+        self.authenticate(identity_pubkey_hex, sign_fn)
+            .await
+            .map_err(SdkError::from)
     }
 
     async fn request_swap(&self, input: RequestSwapInput) -> Result<RequestSwapResponse, SdkError> {
-        let client = self.make_https_client()?;
+        let graphql_input = graphql::SwapRequest {
+            adaptor_pubkey: input.adaptor_pubkey,
+            total_amount_sats: input.total_amount_sats,
+            target_amount_sats: input.target_amount_sats,
+            fee_sats: input.fee_sats,
+            user_leaves: input
+                .user_leaves
+                .into_iter()
+                .map(|l| graphql::SwapLeaf {
+                    leaf_id: l.leaf_id,
+                    raw_unsigned_refund_transaction: l.raw_unsigned_refund_transaction,
+                    adaptor_added_signature: l.adaptor_added_signature,
+                })
+                .collect(),
+            user_outbound_transfer_external_id: input.user_outbound_transfer_external_id,
+            auth_token: input.auth_token,
+        };
 
-        // Build the GraphQL mutation payload.
-        let user_leaves_json: Vec<String> = input
-            .user_leaves
-            .iter()
-            .map(|l| {
-                format!(
-                    r#"{{"leaf_id":"{}","raw_unsigned_refund_transaction":"{}","adaptor_added_signature":"{}"}}"#,
-                    l.leaf_id, l.raw_unsigned_refund_transaction, l.adaptor_added_signature,
-                )
-            })
-            .collect();
-
-        let target_amounts_json: String = input
-            .target_amount_sats
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let variables = format!(
-            r#"{{"input":{{"adaptor_pubkey":"{}","total_amount_sats":{},"target_amount_sats":[{}],"fee_sats":{},"user_leaves":[{}],"user_outbound_transfer_external_id":"{}"}}}}"#,
-            input.adaptor_pubkey,
-            input.total_amount_sats,
-            target_amounts_json,
-            input.fee_sats,
-            user_leaves_json.join(","),
-            input.user_outbound_transfer_external_id,
-        );
-
-        let query = format!(
-            r#"{{"query":"mutation RequestSwap($input: RequestSwapInput!) {{ request_swap(input: $input) {{ request {{ inbound_transfer {{ spark_id }} }} }} }}","variables":{}}}"#,
-            variables,
-        );
-
-        tracing::debug!(body = %query, "SSP request_swap request");
-
-        let body_str = self
-            .graphql_post(&client, query, Some(&input.auth_token))
-            .await?;
-
-        tracing::debug!(response = body_str, "SSP request_swap response");
-        let spark_id = extract_spark_id(&body_str).ok_or(SdkError::SspInvalidResponse)?;
+        let resp = self
+            .request_swap(graphql_input)
+            .await
+            .map_err(SdkError::from)?;
 
         Ok(RequestSwapResponse {
-            inbound_transfer_id: spark_id.to_owned(),
+            inbound_transfer_id: resp.inbound_transfer_id,
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Standard base64 encode (RFC 4648) with padding.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-
-        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-/// Extract the `spark_id` value from a GraphQL JSON response.
-///
-/// Expected shape:
-/// ```json
-/// {"data":{"request_swap":{"request":{"inbound_transfer":{"spark_id":"..."}}}}}
-/// ```
-///
-/// This avoids pulling in serde_json for a single field extraction.
-fn extract_spark_id(json: &str) -> Option<&str> {
-    extract_json_string_field(json, "spark_id")
-}
-
-/// Extract a JSON string field value by key from a flat or nested JSON string.
-///
-/// Searches for `"<key>"` followed by `:` and a quoted string value.
-/// Returns the inner string (without quotes).
-fn extract_json_string_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let search = format!("\"{key}\"");
-    let idx = json.find(&search)?;
-    let after_key = &json[idx + search.len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let after_ws = after_colon.trim_start();
-    let after_quote = after_ws.strip_prefix('"')?;
-    let end = after_quote.find('"')?;
-    Some(&after_quote[..end])
-}
-
-// ---------------------------------------------------------------------------
-// Base64 helpers
-// ---------------------------------------------------------------------------
-
-/// Decode a base64url string (without padding) into bytes.
-///
-/// Performs the URL-safe -> standard base64 translation and padding
-/// in a single stack-allocated buffer to avoid intermediate `String`s.
-fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    let pad = match input.len() % 4 {
-        0 => 0u8,
-        2 => 2,
-        3 => 1,
-        _ => return None,
-    };
-
-    // Translate URL-safe chars to standard base64 in a single Vec<u8>.
-    let mut buf = Vec::with_capacity(input.len() + pad as usize);
-    for &b in input.as_bytes() {
-        buf.push(match b {
-            b'-' => b'+',
-            b'_' => b'/',
-            other => other,
-        });
-    }
-    // Pad to 4-byte boundary (0–2 '=' chars).
-    buf.resize(buf.len() + pad as usize, b'=');
-
-    base64_decode_standard_bytes(&buf)
-}
-
-/// Standard base64 decode (RFC 4648) from raw bytes.
-fn base64_decode_standard_bytes(input: &[u8]) -> Option<Vec<u8>> {
-    const TABLE: [u8; 128] = {
-        let mut t = [0xFFu8; 128];
-        let mut i = 0u8;
-        while i < 26 {
-            t[(b'A' + i) as usize] = i;
-            t[(b'a' + i) as usize] = i + 26;
-            i += 1;
-        }
-        let mut d = 0u8;
-        while d < 10 {
-            t[(b'0' + d) as usize] = d + 52;
-            d += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t
-    };
-
-    if input.len() % 4 != 0 {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for chunk in input.chunks_exact(4) {
-        let mut vals = [0u8; 4];
-        let mut pad_count = 0u8;
-        for (i, &b) in chunk.iter().enumerate() {
-            if b == b'=' {
-                pad_count += 1;
-                vals[i] = 0;
-            } else if b >= 128 || TABLE[b as usize] == 0xFF {
-                return None;
-            } else {
-                vals[i] = TABLE[b as usize];
-            }
-        }
-        let n = ((vals[0] as u32) << 18)
-            | ((vals[1] as u32) << 12)
-            | ((vals[2] as u32) << 6)
-            | (vals[3] as u32);
-
-        out.push((n >> 16) as u8);
-        if pad_count < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad_count < 1 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_spark_id_from_response() {
-        let json = r#"{"data":{"request_swap":{"request":{"inbound_transfer":{"spark_id":"abc-123-def"}}}}}"#;
-        assert_eq!(extract_spark_id(json), Some("abc-123-def"));
-    }
-
-    #[test]
-    fn extract_spark_id_missing() {
-        assert_eq!(extract_spark_id(r#"{"data":{}}"#), None);
-    }
-
-    #[test]
-    fn extract_json_string_field_works() {
-        let json = r#"{"data":{"verify_challenge":{"session_token":"tok123"}}}"#;
-        assert_eq!(
-            extract_json_string_field(json, "session_token"),
-            Some("tok123")
-        );
-    }
-
-    #[test]
-    fn extract_json_string_field_missing() {
-        assert_eq!(
-            extract_json_string_field(r#"{"data":{}}"#, "session_token"),
-            None
-        );
-    }
-
-    #[test]
-    fn hex_decode_pubkey_valid() {
-        let hex = "02".to_owned() + &"ab".repeat(32);
-        let result = crate::utils::hex_decode_pubkey(&hex);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap()[0], 0x02);
-        assert_eq!(result.unwrap()[1], 0xab);
-    }
-
-    #[test]
-    fn hex_decode_pubkey_wrong_length() {
-        assert!(crate::utils::hex_decode_pubkey("0102").is_none());
-    }
-
-    #[test]
-    fn base64url_decode_works() {
-        // Standard base64 "AQID" = [1, 2, 3]
-        assert_eq!(base64url_decode("AQID"), Some(vec![1, 2, 3]));
-        // URL-safe: '-' instead of '+', '_' instead of '/'
-        let result = base64url_decode("AP__");
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn base64_encode_round_trip() {
-        let data = b"hello world";
-        let encoded = base64_encode(data);
-        assert_eq!(encoded, "aGVsbG8gd29ybGQ=");
-    }
-
-    #[test]
-    fn base64url_decode_real_challenge() {
-        // A real protected_challenge from the SSP (base64url).
-        let pc = "CAFSTwgBUNyBtMwGogEg0tppfumnJfyoYQXyTew-XPayF9c6wGnG0A_z8x_LUAPyASECaYsnrDCLJ1Zxs8olQ2NGRp0EpbuleK45_rodZYl6aryiASDZS7gAD-fZo64FiHXc2WOIel5WEg2rd9QIfMNk1yGUKw";
-        let decoded = base64url_decode(pc);
-        assert!(decoded.is_some(), "should base64url decode");
-        // Full ProtectedChallenge is 118 bytes for this test vector.
-        assert_eq!(decoded.unwrap().len(), 118);
     }
 }

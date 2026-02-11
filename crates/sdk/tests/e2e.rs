@@ -157,7 +157,7 @@ fn make_sdk_with_ssp(
     mnemonic: &Mnemonic,
     pubkey: &IdentityPubKey,
     account: u32,
-) -> Sdk<InMemoryWalletStore, InMemoryTreeStore, InMemoryTokenStore, sdk::ssp::GraphqlSspClient> {
+) -> Sdk<InMemoryWalletStore, InMemoryTreeStore, InMemoryTokenStore, graphql::GraphqlSspClient> {
     let wallet_store = InMemoryWalletStore::new();
     wallet_store
         .insert(
@@ -174,7 +174,7 @@ fn make_sdk_with_ssp(
     };
 
     let ssp_client =
-        sdk::ssp::GraphqlSspClient::from_config(&NETWORK_CONFIG.ssp).expect("valid SSP config");
+        graphql::GraphqlSspClient::from_config(&NETWORK_CONFIG.ssp).expect("valid SSP config");
 
     Sdk::new(
         config,

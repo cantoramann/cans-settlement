@@ -7,5 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "SSP GraphQL client: HTTPS transport and authentication"
 
 [dependencies]
+config = { path = "../config" }
+bitcoin = { workspace = true }
+hyper = { version = "1", features = ["http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http2", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+http-body-util = "0.1"
+tracing = "0.1"

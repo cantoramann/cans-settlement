@@ -11,6 +11,7 @@ description = "Spark SDK: wallet operations, transfers, tokens, and Lightning"
 
 [dependencies]
 config = { path = "../config" }
+graphql = { path = "../graphql" }
 sdk-core = { workspace = true }
 signer = { path = "../signer" }
 spark-crypto = { workspace = true }
@@ -24,11 +25,6 @@ rand_core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"
 tonic = { workspace = true }
-hyper = { version = "1", features = ["http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http2", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-http-body-util = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]

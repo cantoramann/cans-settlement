@@ -85,3 +85,18 @@ impl fmt::Display for SdkError {
 }
 
 impl std::error::Error for SdkError {}
+
+// ---------------------------------------------------------------------------
+// From<graphql::SspError>
+// ---------------------------------------------------------------------------
+
+impl From<graphql::SspError> for SdkError {
+    fn from(e: graphql::SspError) -> Self {
+        match e {
+            graphql::SspError::InvalidConfig(_) => Self::InvalidRequest,
+            graphql::SspError::TlsFailed | graphql::SspError::RequestFailed => Self::SspSwapFailed,
+            graphql::SspError::InvalidResponse => Self::SspInvalidResponse,
+            graphql::SspError::SigningFailed => Self::SigningFailed,
+        }
+    }
+}

@@ -755,6 +755,16 @@ dependencies = [
 [[package]]
 name = "graphql"
 version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "config",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "tracing",
+]
 
 [[package]]
 name = "group"
@@ -1810,14 +1820,10 @@ dependencies = [
  "bytes",
  "config",
  "funding-client",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
+ "graphql",
  "prost",
  "prost-types",
  "rand_core 0.6.4",
- "rustls",
  "sdk-core",
  "signer",
  "spark-crypto",
