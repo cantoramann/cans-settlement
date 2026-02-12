@@ -56,6 +56,8 @@ pub mod bitcoin_tx;
 pub mod error;
 pub mod frost_bridge;
 pub mod hooks;
+#[cfg(feature = "ledger")]
+pub mod ledger;
 pub mod network;
 pub mod operations;
 pub mod ssp;
