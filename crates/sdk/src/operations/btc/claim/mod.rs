@@ -24,11 +24,15 @@ mod key_tweaks;
 mod signing;
 mod verify_decrypt;
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use signer::WalletSigner;
+use tracing::{debug, info, warn};
 use transport::{common, spark};
 
 use crate::operations::convert::proto_to_tree_node;
+use crate::operations::tracking::{OperationError, OperationKind, OperationStep};
 use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
@@ -62,11 +66,16 @@ where
     /// Queries the coordinator for **all** pending transfers for this
     /// receiver and claims them. Use [`Self::claim_by_transfer_id`] to
     /// claim a specific transfer (e.g. an SSP swap inbound).
+    ///
+    /// Returns [`OperationError`] on failure, which includes the operation
+    /// ID, the failing step, and all steps that completed before the
+    /// failure. When some transfers succeed and others fail, the status
+    /// is [`OperationStatus::PartiallyCompleted`].
     pub async fn claim_transfer(
         &self,
         receiver_pubkey: &IdentityPubKey,
         signer: &impl WalletSigner,
-    ) -> Result<ClaimTransferResult, SdkError> {
+    ) -> Result<ClaimTransferResult, OperationError> {
         self.claim_inner(receiver_pubkey, signer, None).await
     }
 
@@ -79,27 +88,42 @@ where
         receiver_pubkey: &IdentityPubKey,
         transfer_id: &str,
         signer: &impl WalletSigner,
-    ) -> Result<ClaimTransferResult, SdkError> {
+    ) -> Result<ClaimTransferResult, OperationError> {
         self.claim_inner(receiver_pubkey, signer, Some(transfer_id))
             .await
     }
 
     /// Shared claim logic with optional transfer ID filter.
+    ///
+    /// Tracks every step via [`OperationTracker`]. The claim loop uses
+    /// continue-on-error: if one transfer fails, others are still
+    /// attempted. Transient errors are retried per the configured
+    /// [`RetryPolicy`].
     async fn claim_inner(
         &self,
         receiver_pubkey: &IdentityPubKey,
         signer: &impl WalletSigner,
         transfer_id: Option<&str>,
-    ) -> Result<ClaimTransferResult, SdkError> {
-        self.check_cancelled()?;
+    ) -> Result<ClaimTransferResult, OperationError> {
+        let mut tracker = self.tracker(OperationKind::Claim);
+        let op_id = tracker.id();
 
-        let _wallet = self
-            .inner
-            .wallet_store
-            .resolve(receiver_pubkey)
-            .ok_or(SdkError::WalletNotFound)?;
+        // Cancellation check.
+        if let Err(e) = self.check_cancelled() {
+            return Err(tracker.fail(OperationStep::Auth, e));
+        }
 
-        let authed = self.authenticate(signer).await?;
+        if self.inner.wallet_store.resolve(receiver_pubkey).is_none() {
+            return Err(tracker.fail(OperationStep::Auth, SdkError::WalletNotFound));
+        }
+
+        // Authenticate.
+        let t = Instant::now();
+        let authed = match self.authenticate(signer).await {
+            Ok(a) => a,
+            Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+        };
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
 
         // 1. Query pending transfers.
         let network = crate::network::spark_network_proto(self.inner.config.network.network);
@@ -107,7 +131,8 @@ where
             .map(|id| vec![id.to_owned()])
             .unwrap_or_default();
 
-        let pending = authed
+        let t = Instant::now();
+        let pending = match authed
             .query_pending_transfers(spark::TransferFilter {
                 participant: Some(
                     spark::transfer_filter::Participant::ReceiverIdentityPublicKey(
@@ -119,29 +144,136 @@ where
                 ..Default::default()
             })
             .await
-            .map_err(|_| SdkError::TransportFailed)?;
+        {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(tracker.fail(
+                    OperationStep::Transport("query_pending_transfers".into()),
+                    SdkError::TransportFailed,
+                ));
+            }
+        };
+        tracker.step_ok(
+            OperationStep::Transport("query_pending_transfers".into()),
+            t.elapsed(),
+        );
 
         if pending.transfers.is_empty() {
+            tracker.succeed();
             return Ok(ClaimTransferResult { leaves_claimed: 0 });
         }
 
+        info!(
+            op_id = %op_id,
+            transfers = pending.transfers.len(),
+            "claiming pending transfers"
+        );
+
+        // 2. Claim loop: continue-on-error, retry transient failures.
         let mut total_claimed = 0usize;
+        let mut last_error: Option<SdkError> = None;
+        let mut failed_transfers = 0usize;
+        let policy = self.retry_policy().clone();
 
         for transfer in &pending.transfers {
-            self.check_cancelled()?;
+            if self.is_cancelled() {
+                break;
+            }
 
-            // Run pre-claim hook chain (no-op when empty).
-            self.inner.hooks.run_pre_claim(transfer).await?;
+            let tid = &transfer.id;
+            let step = OperationStep::ClaimSingleTransfer(tid.clone());
 
-            let claimed = self
-                .claim_single_transfer(&authed, transfer, receiver_pubkey, signer)
-                .await?;
-            total_claimed += claimed;
+            // Pre-claim hooks.
+            let t = Instant::now();
+            if let Err(e) = self.inner.hooks.run_pre_claim(transfer).await {
+                warn!(op_id = %op_id, transfer_id = %tid, "pre-claim hook rejected");
+                tracker.step_failed(OperationStep::PreClaimHook, e, t.elapsed());
+                last_error = Some(e);
+                failed_transfers += 1;
+                continue;
+            }
+            if !self.inner.hooks.pre_claim_is_empty() {
+                tracker.step_ok(OperationStep::PreClaimHook, t.elapsed());
+            }
+
+            // Attempt claim with retry for transient errors.
+            let t = Instant::now();
+            let mut attempt = 0u32;
+            let result = loop {
+                match self
+                    .claim_single_transfer(&authed, transfer, receiver_pubkey, signer)
+                    .await
+                {
+                    Ok(claimed) => break Ok(claimed),
+                    Err(e) if e.is_transient() && attempt + 1 < policy.max_attempts => {
+                        attempt += 1;
+                        let backoff = policy.backoff_for(attempt - 1);
+                        debug!(
+                            op_id = %op_id,
+                            transfer_id = %tid,
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            "transient claim error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+
+            match result {
+                Ok(claimed) => {
+                    total_claimed += claimed;
+                    if attempt > 0 {
+                        tracker.step_retried(step, attempt, t.elapsed());
+                    } else {
+                        tracker.step_ok(step, t.elapsed());
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        op_id = %op_id,
+                        transfer_id = %tid,
+                        ?e,
+                        "claim failed after {} attempt(s)",
+                        attempt + 1
+                    );
+                    tracker.step_failed(step, e, t.elapsed());
+                    last_error = Some(e);
+                    failed_transfers += 1;
+                }
+            }
         }
 
-        Ok(ClaimTransferResult {
-            leaves_claimed: total_claimed,
-        })
+        // 3. Determine final status.
+        if failed_transfers == 0 {
+            info!(
+                op_id = %op_id,
+                total_claimed,
+                "all transfers claimed"
+            );
+            tracker.succeed();
+            Ok(ClaimTransferResult {
+                leaves_claimed: total_claimed,
+            })
+        } else if total_claimed > 0 {
+            // Some succeeded, some failed.
+            warn!(
+                op_id = %op_id,
+                total_claimed,
+                failed = failed_transfers,
+                "partial claim"
+            );
+            Err(tracker.partial(
+                OperationStep::ClaimSingleTransfer("multi".into()),
+                last_error.unwrap_or(SdkError::OperationFailed),
+            ))
+        } else {
+            Err(tracker.fail(
+                OperationStep::ClaimSingleTransfer("all".into()),
+                last_error.unwrap_or(SdkError::OperationFailed),
+            ))
+        }
     }
 
     /// Claim a single pending transfer.

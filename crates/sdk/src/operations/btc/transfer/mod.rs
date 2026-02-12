@@ -33,9 +33,13 @@
 
 mod signing;
 
+use std::time::Instant;
+
 use signer::WalletSigner;
+use tracing::info;
 
 use crate::network::bitcoin_network;
+use crate::operations::tracking::{OperationError, OperationKind, OperationStep};
 use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
@@ -78,54 +82,98 @@ where
         receiver_pubkey: &IdentityPubKey,
         amount_sats: u64,
         signer: &impl WalletSigner,
-    ) -> Result<SendTransferResult, SdkError> {
-        self.check_cancelled()?;
+    ) -> Result<SendTransferResult, OperationError> {
+        let mut tracker = self.tracker(OperationKind::Transfer);
+        let op_id = tracker.id();
 
-        let _wallet = self
-            .inner
-            .wallet_store
-            .resolve(sender_pubkey)
-            .ok_or(SdkError::WalletNotFound)?;
+        if let Err(e) = self.check_cancelled() {
+            return Err(tracker.fail(OperationStep::Auth, e));
+        }
 
-        let authed = self.authenticate(signer).await?;
+        if self.inner.wallet_store.resolve(sender_pubkey).is_none() {
+            return Err(tracker.fail(OperationStep::Auth, SdkError::WalletNotFound));
+        }
+
+        // Auth.
+        let t = Instant::now();
+        let authed = match self.authenticate(signer).await {
+            Ok(a) => a,
+            Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+        };
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
+
         let network = bitcoin_network(self.inner.config.network.network);
 
-        // 1. Select and reserve leaves.
+        // Leaf selection.
+        let t = Instant::now();
         let selector = self.leaf_selector();
-        let available = self.inner.tree_store.get_available_leaves()?;
-        let (selected, total) =
-            selector.select(&available, amount_sats).ok_or(SdkError::InsufficientBalance)?;
+        let available = match self.inner.tree_store.get_available_leaves() {
+            Ok(a) => a,
+            Err(_) => return Err(tracker.fail(OperationStep::LeafSelection, SdkError::StoreFailed)),
+        };
+        let (selected, total) = match selector.select(&available, amount_sats) {
+            Some(s) => s,
+            None => {
+                return Err(tracker.fail(OperationStep::LeafSelection, SdkError::InsufficientBalance))
+            }
+        };
+        tracker.step_ok(OperationStep::LeafSelection, t.elapsed());
 
         let change = total - amount_sats;
 
-        // 2. If there's change, SSP swap first.
-        //    `ssp_swap` sends the oversized leaves to the SSP, claims the
-        //    inbound transfer, and inserts the exact-denomination leaves
-        //    into the tree store. We then re-select and proceed.
+        // SSP swap if change needed.
         if change > 0 {
+            let t = Instant::now();
             let fee = crate::ssp::SSP_SWAP_FEE_SATS;
             let target_amounts = vec![amount_sats, change.saturating_sub(fee)];
 
-            self.ssp_swap(sender_pubkey, &selected, &target_amounts, signer)
-                .await?;
+            if let Err(e) = self
+                .ssp_swap(sender_pubkey, &selected, &target_amounts, signer)
+                .await
+            {
+                return Err(tracker.fail(OperationStep::SspSwap, e));
+            }
 
-            // Remove the leaves we sent to the SSP -- they're no longer ours.
             let spent_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
-            self.inner.tree_store.remove_leaves(&spent_ids)?;
+            if let Err(_) = self.inner.tree_store.remove_leaves(&spent_ids) {
+                return Err(tracker.fail(OperationStep::SspSwap, SdkError::StoreFailed));
+            }
+            tracker.step_ok(OperationStep::SspSwap, t.elapsed());
 
-            // Re-authenticate: the swap's internal claim may have cycled
-            // the session token with the coordinator.
-            let authed = self.authenticate(signer).await?;
+            // Re-authenticate after swap.
+            let t = Instant::now();
+            let authed = match self.authenticate(signer).await {
+                Ok(a) => a,
+                Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+            };
+            tracker.step_ok(OperationStep::Auth, t.elapsed());
 
-            // Re-select from the freshly claimed leaves.
-            let refreshed = self.inner.tree_store.get_available_leaves()?;
-            let (re_selected, _re_total) = selector
-                .select(&refreshed, amount_sats)
-                .ok_or(SdkError::InsufficientBalance)?;
+            // Re-select.
+            let refreshed = match self.inner.tree_store.get_available_leaves() {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(tracker.fail(OperationStep::LeafSelection, SdkError::StoreFailed))
+                }
+            };
+            let (re_selected, _) = match selector.select(&refreshed, amount_sats) {
+                Some(s) => s,
+                None => {
+                    return Err(tracker.fail(
+                        OperationStep::LeafSelection,
+                        SdkError::InsufficientBalance,
+                    ))
+                }
+            };
 
             let leaf_ids: Vec<&str> = re_selected.iter().map(|l| l.id.as_str()).collect();
-            let reservation = self.inner.tree_store.reserve_leaves(&leaf_ids)?;
+            let reservation = match self.inner.tree_store.reserve_leaves(&leaf_ids) {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed))
+                }
+            };
 
+            let t = Instant::now();
             let result = signing::send_transfer_inner(
                 self,
                 &authed,
@@ -139,22 +187,40 @@ where
 
             return match result {
                 Ok(resp) => {
-                    self.inner
+                    tracker.step_ok(OperationStep::TransferSubmit, t.elapsed());
+                    if let Err(_) = self
+                        .inner
                         .tree_store
-                        .finalize_reservation(reservation.id, None)?;
+                        .finalize_reservation(reservation.id, None)
+                    {
+                        return Err(
+                            tracker.fail(OperationStep::Finalization, SdkError::StoreFailed)
+                        );
+                    }
+                    tracker.step_ok(OperationStep::Finalization, t.elapsed());
+                    info!(op_id = %op_id, amount_sats, "transfer sent");
+                    tracker.succeed();
                     Ok(resp)
                 }
                 Err(e) => {
                     let _ = self.inner.tree_store.cancel_reservation(reservation.id);
-                    Err(e)
+                    Err(tracker.fail(OperationStep::TransferSubmit, e))
                 }
             };
         }
 
+        // No change -- direct transfer.
+        let t_res = Instant::now();
         let leaf_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
-        let reservation = self.inner.tree_store.reserve_leaves(&leaf_ids)?;
+        let reservation = match self.inner.tree_store.reserve_leaves(&leaf_ids) {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed))
+            }
+        };
+        tracker.step_ok(OperationStep::Reservation, t_res.elapsed());
 
-        // From here, any error should cancel the reservation.
+        let t = Instant::now();
         let result = signing::send_transfer_inner(
             self,
             &authed,
@@ -168,16 +234,21 @@ where
 
         match result {
             Ok(resp) => {
-                // Finalize: remove spent leaves.
-                self.inner
+                tracker.step_ok(OperationStep::TransferSubmit, t.elapsed());
+                if let Err(_) = self
+                    .inner
                     .tree_store
-                    .finalize_reservation(reservation.id, None)?;
+                    .finalize_reservation(reservation.id, None)
+                {
+                    return Err(tracker.fail(OperationStep::Finalization, SdkError::StoreFailed));
+                }
+                info!(op_id = %op_id, amount_sats, "transfer sent");
+                tracker.succeed();
                 Ok(resp)
             }
             Err(e) => {
-                // Cancel reservation on failure.
                 let _ = self.inner.tree_store.cancel_reservation(reservation.id);
-                Err(e)
+                Err(tracker.fail(OperationStep::TransferSubmit, e))
             }
         }
     }

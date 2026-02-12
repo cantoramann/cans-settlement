@@ -39,11 +39,9 @@ use crate::tree::{TreeNode, TreeStore};
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
 
-/// Maximum number of claim attempts when waiting for the SSP's inbound transfer.
-const SSP_CLAIM_MAX_ATTEMPTS: u32 = 10;
+use std::time::Instant;
 
-/// Initial delay between claim attempts (doubles on each retry).
-const SSP_CLAIM_INITIAL_DELAY_MS: u64 = 500;
+use crate::operations::tracking::{OperationKind, OperationStep};
 
 // ---------------------------------------------------------------------------
 // Sdk::ssp_swap
@@ -71,9 +69,13 @@ where
         target_amounts: &[u64],
         signer: &impl WalletSigner,
     ) -> Result<Vec<TreeNode>, SdkError> {
+        let mut tracker = self.tracker(OperationKind::Swap);
+
         self.check_cancelled()?;
 
+        let t = Instant::now();
         let authed = self.authenticate(signer).await?;
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
         let network = crate::network::bitcoin_network(self.inner.config.network.network);
         let secp = Secp256k1::new();
         let num_operators = self.inner.config.network.num_operators();
@@ -291,17 +293,21 @@ where
 
         // 12. Poll for the SSP's inbound transfer and claim it.
         //     The SSP may need a moment to create the inbound transfer after
-        //     `request_swap` returns, so we retry with exponential backoff.
-        let mut delay_ms = SSP_CLAIM_INITIAL_DELAY_MS;
+        //     `request_swap` returns, so we retry with the configured policy.
+        let policy = self.retry_policy().clone();
+        let max_claim_attempts = policy.max_attempts.max(3) * 3; // more generous for SSP polling
 
-        for attempt in 1..=SSP_CLAIM_MAX_ATTEMPTS {
+        let t = Instant::now();
+        for attempt in 1..=max_claim_attempts {
             self.check_cancelled()?;
 
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let backoff = policy.backoff_for(attempt.saturating_sub(1));
+            tokio::time::sleep(backoff).await;
 
             let claim_result = self
                 .claim_by_transfer_id(sender_pubkey, inbound_id, signer)
-                .await?;
+                .await
+                .map_err(SdkError::from)?;
 
             if claim_result.leaves_claimed > 0 {
                 tracing::info!(
@@ -309,20 +315,32 @@ where
                     attempt,
                     "SSP swap inbound claimed"
                 );
+                tracker.step_ok(
+                    OperationStep::Transport("claim_ssp_inbound".into()),
+                    t.elapsed(),
+                );
 
                 // Return the freshly claimed leaves from the tree store.
                 let all_leaves = self.inner.tree_store.get_available_leaves()?;
+                tracker.succeed();
                 return Ok(all_leaves);
             }
 
-            tracing::debug!(attempt, delay_ms, "SSP inbound not ready, retrying");
-            delay_ms = (delay_ms * 2).min(5_000);
+            tracing::debug!(
+                attempt,
+                backoff_ms = backoff.as_millis(),
+                "SSP inbound not ready, retrying"
+            );
         }
 
         tracing::error!(
             transfer_id = %inbound_id,
-            "SSP inbound transfer not claimable after {} attempts",
-            SSP_CLAIM_MAX_ATTEMPTS
+            "SSP inbound transfer not claimable after {max_claim_attempts} attempts",
+        );
+        tracker.step_failed(
+            OperationStep::Transport("claim_ssp_inbound".into()),
+            SdkError::SspSwapFailed,
+            t.elapsed(),
         );
         Err(SdkError::SspSwapFailed)
     }

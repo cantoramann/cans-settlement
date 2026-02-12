@@ -172,4 +172,12 @@ impl Hooks {
         }
         Ok(())
     }
+
+    /// Returns `true` if there are no pre-claim hooks registered.
+    pub(crate) fn pre_claim_is_empty(&self) -> bool {
+        self.pre_claim
+            .try_read()
+            .map(|chain| chain.is_empty())
+            .unwrap_or(true)
+    }
 }

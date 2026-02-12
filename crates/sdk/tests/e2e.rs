@@ -107,6 +107,7 @@ fn make_sdk_with_wallets(
 
     let config = SdkConfig {
         network: NETWORK_CONFIG,
+        retry_policy: sdk::tracking::RetryPolicy::default(),
     };
 
     Sdk::new(
@@ -139,6 +140,7 @@ fn make_sdk_with_wallet(
 
     let config = SdkConfig {
         network: NETWORK_CONFIG,
+        retry_policy: sdk::tracking::RetryPolicy::default(),
     };
 
     Sdk::new(
@@ -171,6 +173,7 @@ fn make_sdk_with_ssp(
 
     let config = SdkConfig {
         network: NETWORK_CONFIG,
+        retry_policy: sdk::tracking::RetryPolicy::default(),
     };
 
     let ssp_client =

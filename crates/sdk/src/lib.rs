@@ -29,6 +29,7 @@
 //! # async fn example() -> Result<(), sdk::SdkError> {
 //! let config = SdkConfig {
 //!     network: NetworkConfig::for_network(Network::Mainnet),
+//!     retry_policy: sdk::tracking::RetryPolicy::default(),
 //! };
 //! let cancel = CancellationToken::new();
 //!
@@ -64,6 +65,7 @@ pub(crate) mod utils;
 pub mod wallet_store;
 
 pub use error::SdkError;
+pub use operations::tracking;
 
 use std::sync::Arc;
 
@@ -72,6 +74,9 @@ use tokio_util::sync::CancellationToken;
 use transport::grpc::{AuthenticatedTransport, GrpcConfig, GrpcTransport, OperatorConfig};
 
 use crate::hooks::{Hook, HookPoint, Hooks};
+use crate::operations::tracking::{
+    NoopOperationStore, OperationStore, OperationTracker, RetryPolicy,
+};
 use crate::ssp::SspClient;
 use crate::token::TokenStore;
 use crate::tree::{GreedySelector, LeafSelector, TreeStore};
@@ -82,10 +87,13 @@ use crate::wallet_store::WalletStore;
 // ---------------------------------------------------------------------------
 
 /// SDK configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SdkConfig {
     /// Network-specific operator and SSP configuration.
     pub network: NetworkConfig,
+    /// Retry policy for transient errors. Defaults to 3 attempts with
+    /// exponential backoff (500ms initial, 2x multiplier, 10s cap).
+    pub retry_policy: RetryPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +106,7 @@ pub(crate) struct SdkInner<W, T, K, S> {
     pub transport: GrpcTransport,
     pub hooks: Hooks,
     pub leaf_selector: std::sync::RwLock<Arc<dyn LeafSelector>>,
+    pub operation_store: std::sync::RwLock<Arc<dyn OperationStore>>,
     pub wallet_store: W,
     pub tree_store: T,
     pub token_store: K,
@@ -182,6 +191,7 @@ where
                 transport,
                 hooks: Hooks::new(),
                 leaf_selector: std::sync::RwLock::new(Arc::new(GreedySelector)),
+                operation_store: std::sync::RwLock::new(Arc::new(NoopOperationStore)),
                 wallet_store,
                 tree_store,
                 token_store,
@@ -247,6 +257,36 @@ where
             .transport
             .authenticated(&token)
             .map_err(|_| SdkError::AuthFailed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Operation tracking
+    // -----------------------------------------------------------------------
+
+    /// Replace the operation store at runtime.
+    ///
+    /// Use [`tracking::InMemoryOperationStore`] for observability, or
+    /// implement [`OperationStore`] for persistent crash recovery.
+    pub fn set_operation_store(&self, store: Arc<dyn OperationStore>) {
+        *self.inner.operation_store.write().unwrap() = store;
+    }
+
+    /// Get the current operation store (cheap `Arc` clone).
+    pub fn operation_store(&self) -> Arc<dyn OperationStore> {
+        self.inner.operation_store.read().unwrap().clone()
+    }
+
+    /// Start tracking a new operation.
+    pub(crate) fn tracker(
+        &self,
+        kind: tracking::OperationKind,
+    ) -> OperationTracker {
+        OperationTracker::start(self.operation_store(), kind)
+    }
+
+    /// The configured retry policy.
+    pub(crate) fn retry_policy(&self) -> &RetryPolicy {
+        &self.inner.config.retry_policy
     }
 
     // -----------------------------------------------------------------------

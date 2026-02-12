@@ -75,7 +75,10 @@ async fn main() {
     let cancel = CancellationToken::new();
 
     let sdk = Sdk::new(
-        SdkConfig { network: NETWORK },
+        SdkConfig {
+            network: NETWORK,
+            retry_policy: sdk::tracking::RetryPolicy::default(),
+        },
         wallet_store,
         InMemoryTreeStore::new(),
         InMemoryTokenStore::new(),

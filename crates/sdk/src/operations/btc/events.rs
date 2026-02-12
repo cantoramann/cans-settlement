@@ -113,8 +113,14 @@ where
                                     Ok(result) => {
                                         info!(%transfer_id, leaves = result.leaves_claimed, "auto-claim succeeded");
                                     }
-                                    Err(e) => {
-                                        warn!(%transfer_id, ?e, "auto-claim failed");
+                                    Err(op_err) => {
+                                        warn!(
+                                            %transfer_id,
+                                            op_id = %op_err.operation_id,
+                                            step = %op_err.failed_step,
+                                            error = %op_err.error,
+                                            "auto-claim failed"
+                                        );
                                     }
                                 }
                             } else {
