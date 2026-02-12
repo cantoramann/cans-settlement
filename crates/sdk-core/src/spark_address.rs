@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn real_sparkscan_address() {
+    fn real_sparkscan_client_address() {
         let pubkey_hex_str = "0341a00a9a26c4c5ba25246c36ba8b527ac4001131d307b51cc5400285b673ecdc";
         let expected_addr =
             "sparkrt1pgssxsdqp2dzd3x9hgjjgmpkh294y7kyqqgnr5c8k5wv2sqzskm88mxu93h6m9";
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_official_sparkscan_address() {
+    fn parse_official_sparkscan_client_address() {
         let official_addr =
             "sparkrt1pgssxsdqp2dzd3x9hgjjgmpkh294y7kyqqgnr5c8k5wv2sqzskm88mxu93h6m9";
 

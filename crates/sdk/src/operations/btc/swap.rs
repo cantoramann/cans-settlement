@@ -80,7 +80,7 @@ where
         let threshold = self.inner.config.network.threshold;
         let operators = self.inner.config.network.operators();
         let ssp_pk = self.inner.ssp.identity_public_key();
-        let operator_ids: Vec<String> = operators.iter().map(|o| o.id.to_string()).collect();
+        let operator_ids: Vec<&'static str> = operators.iter().map(|o| o.id).collect();
         let mut rng = rand_core::OsRng;
 
         // 1. Generate adaptor secret and public key.

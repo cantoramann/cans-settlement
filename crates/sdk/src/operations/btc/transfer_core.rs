@@ -9,6 +9,7 @@
 //! - Utility functions (hex encoding/decoding, UUID generation, sequence math)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash as _;
@@ -30,7 +31,8 @@ use crate::frost_bridge::commitment_to_proto;
 /// Per-operator VSS share and public key tweaks for a single leaf.
 pub(crate) struct PerOperatorTweak {
     pub secret_share_tweak: spark::SecretShare,
-    pub pubkey_shares_tweak: HashMap<String, Bytes>,
+    /// Shared across all operators for the same leaf (avoids per-operator clone).
+    pub pubkey_shares_tweak: Arc<HashMap<String, Bytes>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +85,7 @@ pub(crate) struct BuildLeafParams<'a> {
     /// Signing threshold.
     pub threshold: usize,
     /// Operator identifiers (in order).
-    pub operator_ids: &'a [String],
+    pub operator_ids: &'a [&'static str],
 }
 
 /// Build a [`LeafTransferContext`] for a single leaf.
@@ -126,17 +128,22 @@ pub(crate) fn build_leaf_context(
         .map_err(|_| SdkError::SigningFailed)?;
 
     // Build pubkey_shares_tweak: operator ID -> compressed pubkey of their share.
-    let mut pubkey_shares_tweak: HashMap<String, Bytes> = HashMap::new();
-    for (i, share) in shares.iter().enumerate() {
-        let share_bytes =
-            spark_crypto::verifiable_secret_sharing::scalar_to_bytes(&share.secret_share.share);
-        let share_sk = SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
-        let share_pk = PublicKey::from_secret_key(secp, &share_sk);
-        pubkey_shares_tweak.insert(
-            params.operator_ids[i].clone(),
-            Bytes::copy_from_slice(&share_pk.serialize()),
-        );
-    }
+    // Wrapped in Arc because every operator gets the same map -- avoids N-1 clones.
+    let pubkey_shares_tweak = {
+        let mut map: HashMap<String, Bytes> = HashMap::with_capacity(shares.len());
+        for (i, share) in shares.iter().enumerate() {
+            let share_bytes =
+                spark_crypto::verifiable_secret_sharing::scalar_to_bytes(&share.secret_share.share);
+            let share_sk =
+                SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
+            let share_pk = PublicKey::from_secret_key(secp, &share_sk);
+            map.insert(
+                params.operator_ids[i].to_string(),
+                Bytes::copy_from_slice(&share_pk.serialize()),
+            );
+        }
+        Arc::new(map)
+    };
 
     // Build per-operator tweak data.
     let mut per_operator_tweaks = Vec::with_capacity(params.num_operators);
@@ -157,7 +164,7 @@ pub(crate) fn build_leaf_context(
                 secret_share: Bytes::copy_from_slice(&share_bytes),
                 proofs,
             },
-            pubkey_shares_tweak: pubkey_shares_tweak.clone(),
+            pubkey_shares_tweak: Arc::clone(&pubkey_shares_tweak),
         });
     }
 
@@ -208,6 +215,107 @@ pub(crate) fn build_leaf_context(
         cpfp_nonce_pair,
         secret_cipher,
         per_operator_tweaks,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Direct refund data (shared by transfer and lightning)
+// ---------------------------------------------------------------------------
+
+/// Additional per-leaf data for direct and direct-from-CPFP refund paths.
+///
+/// `build_leaf_context` produces the CPFP refund; this struct captures the
+/// remaining two refund variants plus their FROST nonces.
+pub(crate) struct DirectRefundData {
+    /// Direct-from-CPFP refund transaction.
+    pub direct_from_cpfp_refund_tx: bitcoin::Transaction,
+    /// Direct refund transaction (if the leaf has a `direct_tx`).
+    pub direct_refund_tx: Option<bitcoin::Transaction>,
+    /// Prev out from `direct_tx` (for direct sighash), if present.
+    pub direct_prev_out: Option<bitcoin::TxOut>,
+    /// FROST nonces for direct-from-CPFP refund.
+    pub direct_from_cpfp_nonce_pair: spark_crypto::frost::FrostNoncePair,
+    /// FROST nonces for direct refund (if applicable).
+    pub direct_nonce_pair: Option<spark_crypto::frost::FrostNoncePair>,
+}
+
+/// Parameters for building direct refund data for a single leaf.
+pub(crate) struct BuildDirectRefundParams<'a> {
+    /// Raw node_tx bytes.
+    pub node_tx: &'a [u8],
+    /// Leaf output index on node_tx.
+    pub vout: u32,
+    /// Value of the leaf's node_tx output.
+    pub prev_out_value: bitcoin::Amount,
+    /// Optional raw direct_tx bytes.
+    pub direct_tx: Option<&'a [u8]>,
+    /// The direct refund sequence from `next_send_sequence`.
+    pub next_direct_seq: bitcoin::Sequence,
+    /// Receiver's xonly public key for refund outputs.
+    pub receiver_xonly: &'a bitcoin::key::XOnlyPublicKey,
+    /// Bitcoin network.
+    pub network: bitcoin::Network,
+}
+
+/// Build [`DirectRefundData`] for a single leaf.
+///
+/// Constructs the direct-from-CPFP refund tx (always), and the direct
+/// refund tx (only if `direct_tx` is present). Generates FROST nonce
+/// pairs for each.
+pub(crate) fn build_direct_refund_data(
+    params: &BuildDirectRefundParams<'_>,
+    current_sk: &SecretKey,
+    rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
+) -> Result<DirectRefundData, SdkError> {
+    let signing_share = spark_crypto::frost::deserialize_signing_share(&current_sk.secret_bytes())
+        .map_err(|_| SdkError::SigningFailed)?;
+    let node_tx =
+        crate::bitcoin_tx::parse_tx(params.node_tx).map_err(|_| SdkError::InvalidRequest)?;
+    let node_txid = node_tx.compute_txid();
+
+    let direct_from_cpfp_refund_tx = crate::bitcoin_tx::create_direct_refund_tx(
+        node_txid,
+        params.vout,
+        params.prev_out_value,
+        params.next_direct_seq,
+        params.receiver_xonly,
+        params.network,
+    );
+
+    let (direct_refund_tx, direct_prev_out) = if let Some(direct_tx_raw) = params.direct_tx {
+        let direct_tx =
+            crate::bitcoin_tx::parse_tx(direct_tx_raw).map_err(|_| SdkError::InvalidRequest)?;
+        let dpo = direct_tx
+            .output
+            .first()
+            .ok_or(SdkError::InvalidRequest)?
+            .clone();
+        let dtx = crate::bitcoin_tx::create_direct_refund_tx(
+            direct_tx.compute_txid(),
+            0,
+            dpo.value,
+            params.next_direct_seq,
+            params.receiver_xonly,
+            params.network,
+        );
+        (Some(dtx), Some(dpo))
+    } else {
+        (None, None)
+    };
+
+    let direct_from_cpfp_nonce_pair = spark_crypto::frost::generate_nonces(&signing_share, rng);
+    let direct_nonce_pair = if direct_refund_tx.is_some() {
+        Some(spark_crypto::frost::generate_nonces(&signing_share, rng))
+    } else {
+        None
+    };
+
+    Ok(DirectRefundData {
+        direct_from_cpfp_refund_tx,
+        direct_refund_tx,
+        direct_prev_out,
+        direct_from_cpfp_nonce_pair,
+        direct_nonce_pair,
     })
 }
 
@@ -349,7 +457,7 @@ pub(crate) fn build_key_tweak_package(
             tweak_list.push(spark::SendLeafKeyTweak {
                 leaf_id: ctx.leaf_id.clone(),
                 secret_share_tweak: Some(op_tweak.secret_share_tweak.clone()),
-                pubkey_shares_tweak: op_tweak.pubkey_shares_tweak.clone(),
+                pubkey_shares_tweak: (*op_tweak.pubkey_shares_tweak).clone(),
                 secret_cipher: Bytes::copy_from_slice(&ctx.secret_cipher),
                 signature: Bytes::copy_from_slice(&sig_compact),
                 refund_signature: Bytes::new(),
@@ -425,6 +533,30 @@ pub(crate) fn build_cpfp_signing_job(
         raw_tx: Bytes::from(serialize_tx(&ctx.cpfp_refund_tx)),
         signing_nonce_commitment: Some(user_commitment),
         user_signature: Bytes::copy_from_slice(user_sig_bytes),
+        signing_commitments: Some(spark::SigningCommitments {
+            signing_commitments: operator_commitments.signing_nonce_commitments.clone(),
+        }),
+    }
+}
+
+/// Build a `UserSignedTxSigningJob` for a direct refund tx.
+pub(crate) fn build_direct_signing_job(
+    ctx: &LeafTransferContext,
+    tx: &bitcoin::Transaction,
+    nonce_pair: &spark_crypto::frost::FrostNoncePair,
+    user_sig: &[u8],
+    operator_commitments: &spark::RequestedSigningCommitments,
+) -> spark::UserSignedTxSigningJob {
+    let pk_bytes = Bytes::copy_from_slice(&ctx.current_pk.serialize());
+    let user_commitment = commitment_to_proto(&nonce_pair.commitment)
+        .expect("commitment serialization should not fail");
+
+    spark::UserSignedTxSigningJob {
+        leaf_id: ctx.leaf_id.clone(),
+        signing_public_key: pk_bytes,
+        raw_tx: Bytes::from(serialize_tx(tx)),
+        signing_nonce_commitment: Some(user_commitment),
+        user_signature: Bytes::from(user_sig.to_vec()),
         signing_commitments: Some(spark::SigningCommitments {
             signing_commitments: operator_commitments.signing_nonce_commitments.clone(),
         }),

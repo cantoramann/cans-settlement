@@ -10,7 +10,7 @@ members = [
     "crates/config",
     "crates/sdk",
     "tools/funding-client",
-    "bins/wallet-server",
+    "bins/wallet-server", "crates/sparkscan-client",
 ]
 
 resolver = "2"
