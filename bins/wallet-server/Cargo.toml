@@ -11,11 +11,18 @@ description = "Minimal wallet server binary using the Spark SDK"
 
 [dependencies]
 sdk = { path = "../../crates/sdk" }
+sdk-core = { workspace = true }
 graphql = { path = "../../crates/graphql" }
 config = { path = "../../crates/config" }
 signer = { path = "../../crates/signer" }
+bip39 = "2"
 bitcoin = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+rand_core = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = true

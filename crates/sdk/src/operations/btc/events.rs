@@ -15,6 +15,7 @@
 
 use bytes::Bytes;
 use signer::WalletSigner;
+use tracing::{debug, info, warn};
 use transport::spark;
 
 use crate::operations::convert::proto_to_tree_node;
@@ -70,6 +71,8 @@ where
             .await
             .map_err(|_| SdkError::TransportFailed)?;
 
+        info!("event stream connected, waiting for events");
+
         let mut events_processed = 0usize;
 
         loop {
@@ -84,19 +87,38 @@ where
 
             let resp = match msg {
                 Some(Ok(resp)) => resp,
-                Some(Err(_)) => break,
-                None => break, // Stream ended.
+                Some(Err(status)) => {
+                    warn!(?status, "event stream error");
+                    break;
+                }
+                None => {
+                    info!("event stream ended by server");
+                    break;
+                }
             };
 
             match resp.event {
                 Some(spark::subscribe_to_events_response::Event::Transfer(transfer_event)) => {
                     if let Some(ref transfer) = transfer_event.transfer {
+                        let transfer_id = &transfer.id;
+                        let leaves = transfer.leaves.len();
+                        info!(%transfer_id, leaves, "received transfer event, auto-claiming");
+
                         let receiver_pk = &transfer.receiver_identity_public_key;
                         if receiver_pk.len() == 33 {
                             let mut pk = [0u8; 33];
                             pk.copy_from_slice(receiver_pk);
                             if self.inner.wallet_store.resolve(&pk).is_some() {
-                                let _ = self.claim_transfer(&pk, signer).await;
+                                match self.claim_transfer(&pk, signer).await {
+                                    Ok(result) => {
+                                        info!(%transfer_id, leaves = result.leaves_claimed, "auto-claim succeeded");
+                                    }
+                                    Err(e) => {
+                                        warn!(%transfer_id, ?e, "auto-claim failed");
+                                    }
+                                }
+                            } else {
+                                debug!(%transfer_id, "receiver not in wallet store, skipping");
                             }
                         }
                     }
@@ -104,12 +126,14 @@ where
                 Some(spark::subscribe_to_events_response::Event::Deposit(deposit_event)) => {
                     if let Some(ref node) = deposit_event.deposit {
                         if let Some(tree_node) = proto_to_tree_node(node) {
+                            let value = tree_node.value;
+                            info!(value_sats = value, "received deposit event, inserting leaf");
                             let _ = self.inner.tree_store.insert_leaves(&[tree_node]);
                         }
                     }
                 }
                 Some(spark::subscribe_to_events_response::Event::Connected(_)) => {
-                    // Heartbeat, no action needed.
+                    debug!("event stream heartbeat");
                 }
                 None => {}
             }

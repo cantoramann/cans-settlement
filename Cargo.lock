@@ -2613,10 +2613,13 @@ dependencies = [
 name = "wallet-server"
 version = "0.1.0"
 dependencies = [
+ "bip39",
  "bitcoin",
  "config",
  "graphql",
+ "rand_core 0.6.4",
  "sdk",
+ "sdk-core",
  "signer",
  "tokio",
  "tokio-util",
