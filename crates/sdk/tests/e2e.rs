@@ -815,7 +815,7 @@ async fn fund_claim_send_to_self() {
 /// exceeds the send amount (1 sat), `send_transfer` automatically triggers
 /// an SSP swap, claims the inbound, and re-sends with exact leaves.
 ///
-/// If the faucet sends two 1-sat leaves instead, `select_leaves_greedy`
+/// If the faucet sends two 1-sat leaves instead, the leaf selector
 /// picks one exact leaf (no change) and the non-swap path executes.
 /// Both paths are valid and the test adapts accordingly.
 ///

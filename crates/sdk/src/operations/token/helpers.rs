@@ -19,13 +19,13 @@ pub(crate) const TOKEN_TX_VERSION: u32 = 3;
 /// Returns the keys as `Bytes` sorted in strictly ascending bytewise
 /// order, as required by the coordinator.
 pub(crate) fn operator_identity_keys(config: &config::NetworkConfig) -> Vec<Bytes> {
-    let mut keys: Vec<Vec<u8>> = config
+    let mut keys: Vec<Bytes> = config
         .operators()
         .iter()
-        .filter_map(|op| crate::utils::hex_decode(op.identity_public_key))
+        .filter_map(|op| crate::utils::hex_decode(op.identity_public_key).map(Bytes::from))
         .collect();
     keys.sort();
-    keys.into_iter().map(Bytes::from).collect()
+    keys
 }
 
 /// Create a `TokenTransactionMetadata` for the current network.

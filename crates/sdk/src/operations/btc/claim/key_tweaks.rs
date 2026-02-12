@@ -4,6 +4,8 @@
 //! between the decrypted signing key and their new derived key, then
 //! VSS-split that difference and distribute shares to all operators.
 
+use std::collections::HashMap;
+
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bytes::Bytes;
 use signer::WalletSigner;
@@ -67,7 +69,7 @@ where
                 .map_err(|_| SdkError::SigningFailed)?;
 
             // pubkey_shares_tweak: operator identifier -> compressed public key of share.
-            let mut pubkey_shares_tweak = std::collections::HashMap::new();
+            let mut pubkey_shares_tweak = HashMap::with_capacity(shares.len());
             for (i, share) in shares.iter().enumerate() {
                 let share_bytes = spark_crypto::verifiable_secret_sharing::scalar_to_bytes(
                     &share.secret_share.share,
@@ -75,11 +77,13 @@ where
                 let share_sk =
                     SecretKey::from_slice(&share_bytes).map_err(|_| SdkError::SigningFailed)?;
                 let share_pk = PublicKey::from_secret_key(&secp, &share_sk);
-                let op_identifier = operators[i].id.to_string();
-                pubkey_shares_tweak
-                    .insert(op_identifier, Bytes::copy_from_slice(&share_pk.serialize()));
+                pubkey_shares_tweak.insert(
+                    operators[i].id.to_string(),
+                    Bytes::copy_from_slice(&share_pk.serialize()),
+                );
             }
 
+            let last_idx = shares.len() - 1;
             for (i, share) in shares.iter().enumerate() {
                 let share_bytes = spark_crypto::verifiable_secret_sharing::scalar_to_bytes(
                     &share.secret_share.share,
@@ -94,25 +98,26 @@ where
                     })
                     .collect();
 
+                // Move on the last iteration to avoid one clone.
+                let tweak_map = if i == last_idx {
+                    std::mem::take(&mut pubkey_shares_tweak)
+                } else {
+                    pubkey_shares_tweak.clone()
+                };
+
                 per_operator_tweaks[i].push(spark::ClaimLeafKeyTweak {
                     leaf_id: leaf.leaf_id.clone(),
                     secret_share_tweak: Some(spark::SecretShare {
                         secret_share: Bytes::copy_from_slice(&share_bytes),
                         proofs,
                     }),
-                    pubkey_shares_tweak: pubkey_shares_tweak.clone(),
+                    pubkey_shares_tweak: tweak_map,
                 });
             }
         }
 
-        // Send ClaimTransferTweakKeys to ALL operators in parallel.
-        let operator_ids: Vec<String> = self
-            .inner
-            .transport
-            .operator_ids()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // Send ClaimTransferTweakKeys to ALL operators.
+        let operator_ids = self.inner.transport.operator_ids();
 
         for (i, op_id) in operator_ids.iter().enumerate() {
             let op_token = self

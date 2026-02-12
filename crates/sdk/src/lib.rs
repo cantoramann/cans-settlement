@@ -37,6 +37,7 @@
 //!     InMemoryWalletStore::new(),
 //!     InMemoryTreeStore::new(),
 //!     InMemoryTokenStore::new(),
+//!     sdk::ssp::NoSspClient,
 //!     cancel.clone(),
 //! )?;
 //!

@@ -77,9 +77,6 @@ pub fn create_cpfp_refund_tx(
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     let address = Address::p2tr(&secp, *receiver_xonly, None, network);
 
-    // BIP-431 ephemeral anchor: OP_1 OP_PUSHBYTES_2 0x4e73
-    let anchor_script = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]);
-
     Transaction {
         version: bitcoin::transaction::Version::non_standard(3),
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -96,11 +93,14 @@ pub fn create_cpfp_refund_tx(
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: anchor_script,
+                script_pubkey: ScriptBuf::from_bytes(ANCHOR_SCRIPT_BYTES.to_vec()),
             },
         ],
     }
 }
+
+/// BIP-431 ephemeral anchor script bytes: `OP_1 OP_PUSHBYTES_2 0x4e73`.
+const ANCHOR_SCRIPT_BYTES: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 
 /// Estimated transaction vbyte size for fee calculation (matches Spark operators).
 const ESTIMATED_TX_SIZE: u64 = 191;
@@ -243,9 +243,6 @@ pub fn create_cpfp_htlc_refund_tx(
 ) -> Transaction {
     let htlc_spk = htlc_script_pubkey(payment_hash, receiver_xonly, sender_xonly, network);
 
-    // BIP-431 ephemeral anchor.
-    let anchor_script = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]);
-
     Transaction {
         version: bitcoin::transaction::Version::non_standard(3),
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -262,7 +259,7 @@ pub fn create_cpfp_htlc_refund_tx(
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: anchor_script,
+                script_pubkey: ScriptBuf::from_bytes(ANCHOR_SCRIPT_BYTES.to_vec()),
             },
         ],
     }

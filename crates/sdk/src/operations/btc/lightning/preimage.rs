@@ -49,13 +49,7 @@ where
         .map_err(|_| SdkError::SigningFailed)?;
 
     // Store shares on ALL operators.
-    let operator_ids: Vec<String> = sdk
-        .inner
-        .transport
-        .operator_ids()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let operator_ids = sdk.inner.transport.operator_ids();
 
     for (i, op_id) in operator_ids.iter().enumerate() {
         let op_token = sdk
