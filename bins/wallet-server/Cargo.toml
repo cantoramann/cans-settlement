@@ -1,0 +1,21 @@
+[package]
+name = "wallet-server"
+publish = ["polarity"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Minimal wallet server binary using the Spark SDK"
+
+[dependencies]
+sdk = { path = "../../crates/sdk" }
+graphql = { path = "../../crates/graphql" }
+config = { path = "../../crates/config" }
+signer = { path = "../../crates/signer" }
+bitcoin = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
