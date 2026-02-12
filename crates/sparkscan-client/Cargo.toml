@@ -7,5 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Sparkscan REST API client: fetch transfer data by ID"
 
 [dependencies]
+hyper = { version = "1", features = ["http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http2", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+http-body-util = "0.1"
+serde = { workspace = true }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }

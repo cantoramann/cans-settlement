@@ -9,7 +9,14 @@ repository.workspace = true
 authors.workspace = true
 description = "Spark SDK: wallet operations, transfers, tokens, and Lightning"
 
+[features]
+default = []
+## Enable pre-claim Sparkscan transfer validation.
+## Requires `sparkscan_url` to be set in the `NetworkConfig`.
+sparkscan-validation = ["dep:sparkscan-client"]
+
 [dependencies]
+sparkscan-client = { path = "../sparkscan-client", optional = true }
 config = { path = "../config" }
 graphql = { path = "../graphql" }
 sdk-core = { workspace = true }

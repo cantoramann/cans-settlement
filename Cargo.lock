@@ -1899,6 +1899,7 @@ dependencies = [
  "sdk-core",
  "signer",
  "spark-crypto",
+ "sparkscan-client",
  "storage",
  "tokio",
  "tokio-util",
@@ -2119,6 +2120,17 @@ dependencies = [
 [[package]]
 name = "sparkscan-client"
 version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "spin"

@@ -49,6 +49,16 @@ pub struct NetworkConfig {
 
     /// FROST signing threshold (t of n).
     pub threshold: usize,
+
+    /// Optional Sparkscan API base URL for transfer validation.
+    ///
+    /// When set (and the `sparkscan-validation` feature is enabled in the
+    /// SDK), the SDK can cross-check transfer data against the Sparkscan
+    /// block explorer before claiming.
+    ///
+    /// Defaults to `None` (validation disabled). Set to
+    /// `Some("https://api.sparkscan.io/v1")` to enable.
+    pub sparkscan_url: Option<&'static str>,
 }
 
 impl NetworkConfig {
@@ -75,6 +85,11 @@ impl NetworkConfig {
         &self.operators[self.coordinator_index]
     }
 
+    /// Returns the Sparkscan API base URL, if configured.
+    pub const fn sparkscan_url(&self) -> Option<&'static str> {
+        self.sparkscan_url
+    }
+
     // -----------------------------------------------------------------------
     // Built-in network configurations
     // -----------------------------------------------------------------------
@@ -86,6 +101,7 @@ impl NetworkConfig {
         coordinator_index: 0,
         ssp: SspConfig::MAINNET,
         threshold: 2,
+        sparkscan_url: None,
     };
 
     /// Local regtest configuration.
@@ -95,6 +111,7 @@ impl NetworkConfig {
         coordinator_index: 0,
         ssp: SspConfig::REGTEST,
         threshold: 3,
+        sparkscan_url: None,
     };
 
     /// Public regtest configuration.
@@ -107,6 +124,7 @@ impl NetworkConfig {
         coordinator_index: 0,
         ssp: SspConfig::REGTEST,
         threshold: 2,
+        sparkscan_url: None,
     };
 
     /// Internal dev regtest configuration (sparkinfra.net).
@@ -119,6 +137,7 @@ impl NetworkConfig {
         coordinator_index: 0,
         ssp: SspConfig::DEV_REGTEST,
         threshold: 2,
+        sparkscan_url: None,
     };
 }
 
