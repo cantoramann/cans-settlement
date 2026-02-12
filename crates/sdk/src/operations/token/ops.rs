@@ -150,7 +150,7 @@ where
                 return Err(tracker.fail(
                     OperationStep::TokenAcquire,
                     SdkError::InsufficientTokenBalance,
-                ))
+                ));
             }
         };
         tracker.step_ok(OperationStep::TokenAcquire, t.elapsed());
@@ -239,7 +239,12 @@ where
         tracker.step_ok(OperationStep::TokenBroadcast, t.elapsed());
 
         // 5. Release lock.
-        if self.inner.token_store.release_outputs(acquired.lock_id).is_err() {
+        if self
+            .inner
+            .token_store
+            .release_outputs(acquired.lock_id)
+            .is_err()
+        {
             return Err(tracker.fail(OperationStep::Finalization, SdkError::StoreFailed));
         }
 
@@ -336,7 +341,7 @@ where
                 return Err(tracker.fail(
                     OperationStep::TokenBroadcast,
                     SdkError::InvalidOperatorResponse,
-                ))
+                ));
             }
         };
 

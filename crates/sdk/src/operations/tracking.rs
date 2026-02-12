@@ -302,12 +302,9 @@ impl Operation {
 
     /// Returns `true` if any step succeeded.
     pub fn has_successes(&self) -> bool {
-        self.steps.iter().any(|s| {
-            matches!(
-                s.outcome,
-                StepOutcome::Ok | StepOutcome::Retried(_)
-            )
-        })
+        self.steps
+            .iter()
+            .any(|s| matches!(s.outcome, StepOutcome::Ok | StepOutcome::Retried(_)))
     }
 }
 
@@ -605,11 +602,7 @@ impl OperationTracker {
     }
 
     /// Mark as partially completed, returning an [`OperationError`].
-    pub fn partial(
-        mut self,
-        failed_step: OperationStep,
-        error: SdkError,
-    ) -> OperationError {
+    pub fn partial(mut self, failed_step: OperationStep, error: SdkError) -> OperationError {
         self.op.complete(OperationStatus::PartiallyCompleted);
         self.store
             .complete(self.op.id, OperationStatus::PartiallyCompleted);

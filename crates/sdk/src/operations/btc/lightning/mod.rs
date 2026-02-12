@@ -135,7 +135,9 @@ where
         let (selected, total) = match selector.select(&available, amount_sats) {
             Some(s) => s,
             None => {
-                return Err(tracker.fail(OperationStep::LeafSelection, SdkError::InsufficientBalance))
+                return Err(
+                    tracker.fail(OperationStep::LeafSelection, SdkError::InsufficientBalance)
+                );
             }
         };
         tracker.step_ok(OperationStep::LeafSelection, t.elapsed());
@@ -171,16 +173,15 @@ where
             let refreshed = match self.inner.tree_store.get_available_leaves() {
                 Ok(r) => r,
                 Err(_) => {
-                    return Err(tracker.fail(OperationStep::LeafSelection, SdkError::StoreFailed))
+                    return Err(tracker.fail(OperationStep::LeafSelection, SdkError::StoreFailed));
                 }
             };
             let (re_selected, _) = match selector.select(&refreshed, amount_sats) {
                 Some(s) => s,
                 None => {
-                    return Err(tracker.fail(
-                        OperationStep::LeafSelection,
-                        SdkError::InsufficientBalance,
-                    ))
+                    return Err(
+                        tracker.fail(OperationStep::LeafSelection, SdkError::InsufficientBalance)
+                    );
                 }
             };
 
@@ -188,7 +189,7 @@ where
             let reservation = match self.inner.tree_store.reserve_leaves(&leaf_ids) {
                 Ok(r) => r,
                 Err(_) => {
-                    return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed))
+                    return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed));
                 }
             };
 
@@ -236,9 +237,7 @@ where
         let leaf_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
         let reservation = match self.inner.tree_store.reserve_leaves(&leaf_ids) {
             Ok(r) => r,
-            Err(_) => {
-                return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed))
-            }
+            Err(_) => return Err(tracker.fail(OperationStep::Reservation, SdkError::StoreFailed)),
         };
         tracker.step_ok(OperationStep::Reservation, t_res.elapsed());
 

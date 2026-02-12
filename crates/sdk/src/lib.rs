@@ -277,10 +277,7 @@ where
     }
 
     /// Start tracking a new operation.
-    pub(crate) fn tracker(
-        &self,
-        kind: tracking::OperationKind,
-    ) -> OperationTracker {
+    pub(crate) fn tracker(&self, kind: tracking::OperationKind) -> OperationTracker {
         OperationTracker::start(self.operation_store(), kind)
     }
 
@@ -293,10 +290,7 @@ where
     ///
     /// Returns `None` if the operation was not found (e.g. using
     /// [`tracking::NoopOperationStore`]).
-    pub fn query_operation(
-        &self,
-        id: tracking::OperationId,
-    ) -> Option<tracking::Operation> {
+    pub fn query_operation(&self, id: tracking::OperationId) -> Option<tracking::Operation> {
         self.operation_store().get(id)
     }
 
@@ -319,10 +313,7 @@ where
         &self,
         receiver_pubkey: &crate::wallet_store::IdentityPubKey,
         signer: &impl signer::WalletSigner,
-    ) -> Result<
-        crate::operations::btc::claim::ClaimTransferResult,
-        tracking::OperationError,
-    > {
+    ) -> Result<crate::operations::btc::claim::ClaimTransferResult, tracking::OperationError> {
         self.claim_transfer(receiver_pubkey, signer).await
     }
 
