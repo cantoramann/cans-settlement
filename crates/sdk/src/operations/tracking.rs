@@ -277,6 +277,7 @@ impl Operation {
     }
 
     /// Record a step that happened instantaneously or was skipped.
+    #[allow(dead_code)]
     pub(crate) fn record_instant(&mut self, step: OperationStep, outcome: StepOutcome) {
         self.steps.push(StepRecord {
             step,
@@ -334,8 +335,8 @@ impl fmt::Display for OperationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[{}] {} failed at {}: {}",
-            self.operation_id, "operation", self.failed_step, self.error
+            "[{}] operation failed at {}: {}",
+            self.operation_id, self.failed_step, self.error
         )
     }
 }
@@ -578,6 +579,7 @@ impl OperationTracker {
     }
 
     /// Record a skipped step.
+    #[allow(dead_code)]
     pub fn step_skipped(&mut self, step: OperationStep) {
         self.op.record_instant(step, StepOutcome::Skipped);
         let last = self.op.steps.last().unwrap().clone();

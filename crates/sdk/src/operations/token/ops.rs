@@ -22,9 +22,11 @@
 //! 4. Broadcast
 //! 5. Return `token_identifier` (create) or final tx (mint)
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use signer::WalletSigner;
-use tracing::error;
+use tracing::{error, info};
 use transport::spark_token::{
     self, BroadcastTransactionRequest, FreezeTokensPayload, FreezeTokensRequest,
     PartialTokenOutput, PartialTokenTransaction, QueryTokenMetadataRequest,
@@ -34,6 +36,7 @@ use transport::spark_token::{
 
 use super::hash;
 use super::helpers::{TOKEN_TX_VERSION, build_metadata, sign_digest_der, u128_to_bytes};
+use crate::operations::tracking::{OperationError, OperationKind, OperationStep};
 use crate::token::TokenStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
@@ -120,24 +123,41 @@ where
         token_id: &[u8; 32],
         amount: u128,
         signer: &impl WalletSigner,
-    ) -> Result<SendTokenResult, SdkError> {
-        self.check_cancelled()?;
+    ) -> Result<SendTokenResult, OperationError> {
+        let mut tracker = self.tracker(OperationKind::SendToken);
+        let op_id = tracker.id();
 
-        let _wallet = self
-            .inner
-            .wallet_store
-            .resolve(sender_pubkey)
-            .ok_or(SdkError::WalletNotFound)?;
+        if let Err(e) = self.check_cancelled() {
+            return Err(tracker.fail(OperationStep::Auth, e));
+        }
 
-        let authed = self.authenticate(signer).await?;
+        if self.inner.wallet_store.resolve(sender_pubkey).is_none() {
+            return Err(tracker.fail(OperationStep::Auth, SdkError::WalletNotFound));
+        }
 
-        // 1. Acquire token outputs covering the requested amount.
-        let acquired = self.inner.token_store.acquire_outputs(token_id, amount)?;
+        let t = Instant::now();
+        let authed = match self.authenticate(signer).await {
+            Ok(a) => a,
+            Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+        };
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
+
+        // 1. Acquire token outputs.
+        let t = Instant::now();
+        let acquired = match self.inner.token_store.acquire_outputs(token_id, amount) {
+            Ok(a) => a,
+            Err(_) => {
+                return Err(tracker.fail(
+                    OperationStep::TokenAcquire,
+                    SdkError::InsufficientTokenBalance,
+                ))
+            }
+        };
+        tracker.step_ok(OperationStep::TokenAcquire, t.elapsed());
 
         // 2. Build PartialTokenTransaction.
         let token_id_bytes = Bytes::copy_from_slice(token_id);
 
-        // Transfer input: reference each acquired output.
         let outputs_to_spend: Vec<TokenOutputToSpend> = acquired
             .outputs
             .iter()
@@ -149,7 +169,6 @@ where
 
         let transfer_input = TokenTransferInput { outputs_to_spend };
 
-        // Build outputs: receiver gets the requested amount.
         let mut partial_outputs = vec![PartialTokenOutput {
             owner_public_key: Bytes::copy_from_slice(receiver_pubkey),
             withdraw_bond_sats: config::constants::DEFAULT_WITHDRAW_BOND_SATS,
@@ -158,7 +177,6 @@ where
             token_amount: u128_to_bytes(amount),
         }];
 
-        // Change output: if acquired > amount, send change back to sender.
         if acquired.total_amount > amount {
             let change = acquired.total_amount - amount;
             partial_outputs.push(PartialTokenOutput {
@@ -181,9 +199,10 @@ where
         };
 
         // 3. Hash and sign.
+        let t = Instant::now();
         let tx_hash = hash::hash_partial_token_transaction(&partial_tx);
 
-        let signatures: Vec<SignatureWithIndex> = acquired
+        let signatures: Vec<SignatureWithIndex> = match acquired
             .outputs
             .iter()
             .enumerate()
@@ -194,24 +213,38 @@ where
                     input_index: i as u32,
                 })
             })
-            .collect::<Result<Vec<_>, SdkError>>()?;
+            .collect::<Result<Vec<_>, SdkError>>()
+        {
+            Ok(s) => s,
+            Err(e) => return Err(tracker.fail(OperationStep::Signing, e)),
+        };
+        tracker.step_ok(OperationStep::Signing, t.elapsed());
 
         // 4. Broadcast.
-        let resp = authed
+        let t = Instant::now();
+        let resp = match authed
             .broadcast_transaction(BroadcastTransactionRequest {
                 identity_public_key: Bytes::copy_from_slice(sender_pubkey),
                 partial_token_transaction: Some(partial_tx),
                 token_transaction_owner_signatures: signatures,
             })
             .await
-            .map_err(|e| {
+        {
+            Ok(r) => r,
+            Err(e) => {
                 error!("send_token broadcast failed: {e}");
-                SdkError::TransportFailed
-            })?;
+                return Err(tracker.fail(OperationStep::TokenBroadcast, SdkError::TransportFailed));
+            }
+        };
+        tracker.step_ok(OperationStep::TokenBroadcast, t.elapsed());
 
-        // 5. Release the lock (outputs are spent; re-sync will pick up new state).
-        self.inner.token_store.release_outputs(acquired.lock_id)?;
+        // 5. Release lock.
+        if self.inner.token_store.release_outputs(acquired.lock_id).is_err() {
+            return Err(tracker.fail(OperationStep::Finalization, SdkError::StoreFailed));
+        }
 
+        info!(op_id = %op_id, %amount, "token transfer sent");
+        tracker.succeed();
         Ok(SendTokenResult {
             final_tx: resp.final_token_transaction,
         })
@@ -230,16 +263,24 @@ where
         issuer_pubkey: &IdentityPubKey,
         params: &CreateTokenParams<'_>,
         signer: &impl WalletSigner,
-    ) -> Result<CreateTokenResult, SdkError> {
-        self.check_cancelled()?;
+    ) -> Result<CreateTokenResult, OperationError> {
+        let mut tracker = self.tracker(OperationKind::CreateToken);
+        let op_id = tracker.id();
 
-        let _wallet = self
-            .inner
-            .wallet_store
-            .resolve(issuer_pubkey)
-            .ok_or(SdkError::WalletNotFound)?;
+        if let Err(e) = self.check_cancelled() {
+            return Err(tracker.fail(OperationStep::Auth, e));
+        }
 
-        let authed = self.authenticate(signer).await?;
+        if self.inner.wallet_store.resolve(issuer_pubkey).is_none() {
+            return Err(tracker.fail(OperationStep::Auth, SdkError::WalletNotFound));
+        }
+
+        let t = Instant::now();
+        let authed = match self.authenticate(signer).await {
+            Ok(a) => a,
+            Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+        };
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
 
         let create_input = TokenCreateInput {
             issuer_public_key: Bytes::copy_from_slice(issuer_pubkey),
@@ -252,7 +293,6 @@ where
             extra_metadata: None,
         };
 
-        // Create has no outputs -- the coordinator returns the token_identifier.
         let partial_tx = PartialTokenTransaction {
             version: TOKEN_TX_VERSION,
             token_transaction_metadata: Some(build_metadata(&self.inner.config.network)),
@@ -262,10 +302,16 @@ where
             partial_token_outputs: vec![],
         };
 
+        let t = Instant::now();
         let tx_hash = hash::hash_partial_token_transaction(&partial_tx);
-        let der = sign_digest_der(signer, &tx_hash)?;
+        let der = match sign_digest_der(signer, &tx_hash) {
+            Ok(d) => d,
+            Err(e) => return Err(tracker.fail(OperationStep::Signing, e)),
+        };
+        tracker.step_ok(OperationStep::Signing, t.elapsed());
 
-        let resp = authed
+        let t = Instant::now();
+        let resp = match authed
             .broadcast_transaction(BroadcastTransactionRequest {
                 identity_public_key: Bytes::copy_from_slice(issuer_pubkey),
                 partial_token_transaction: Some(partial_tx),
@@ -275,16 +321,27 @@ where
                 }],
             })
             .await
-            .map_err(|e| {
+        {
+            Ok(r) => r,
+            Err(e) => {
                 error!("create_token broadcast failed: {e}");
-                SdkError::TransportFailed
-            })?;
+                return Err(tracker.fail(OperationStep::TokenBroadcast, SdkError::TransportFailed));
+            }
+        };
+        tracker.step_ok(OperationStep::TokenBroadcast, t.elapsed());
 
-        let token_identifier = resp
-            .token_identifier
-            .map(|b| b.to_vec())
-            .ok_or(SdkError::InvalidOperatorResponse)?;
+        let token_identifier = match resp.token_identifier.map(|b| b.to_vec()) {
+            Some(id) => id,
+            None => {
+                return Err(tracker.fail(
+                    OperationStep::TokenBroadcast,
+                    SdkError::InvalidOperatorResponse,
+                ))
+            }
+        };
 
+        info!(op_id = %op_id, "token created");
+        tracker.succeed();
         Ok(CreateTokenResult { token_identifier })
     }
 
@@ -302,16 +359,24 @@ where
         token_identifier: &[u8],
         outputs: &[(IdentityPubKey, u128)],
         signer: &impl WalletSigner,
-    ) -> Result<MintTokenResult, SdkError> {
-        self.check_cancelled()?;
+    ) -> Result<MintTokenResult, OperationError> {
+        let mut tracker = self.tracker(OperationKind::MintToken);
+        let op_id = tracker.id();
 
-        let _wallet = self
-            .inner
-            .wallet_store
-            .resolve(issuer_pubkey)
-            .ok_or(SdkError::WalletNotFound)?;
+        if let Err(e) = self.check_cancelled() {
+            return Err(tracker.fail(OperationStep::Auth, e));
+        }
 
-        let authed = self.authenticate(signer).await?;
+        if self.inner.wallet_store.resolve(issuer_pubkey).is_none() {
+            return Err(tracker.fail(OperationStep::Auth, SdkError::WalletNotFound));
+        }
+
+        let t = Instant::now();
+        let authed = match self.authenticate(signer).await {
+            Ok(a) => a,
+            Err(e) => return Err(tracker.fail(OperationStep::Auth, e)),
+        };
+        tracker.step_ok(OperationStep::Auth, t.elapsed());
 
         let token_id_bytes = Bytes::copy_from_slice(token_identifier);
 
@@ -341,10 +406,16 @@ where
             partial_token_outputs: partial_outputs,
         };
 
+        let t = Instant::now();
         let tx_hash = hash::hash_partial_token_transaction(&partial_tx);
-        let der = sign_digest_der(signer, &tx_hash)?;
+        let der = match sign_digest_der(signer, &tx_hash) {
+            Ok(d) => d,
+            Err(e) => return Err(tracker.fail(OperationStep::Signing, e)),
+        };
+        tracker.step_ok(OperationStep::Signing, t.elapsed());
 
-        let resp = authed
+        let t = Instant::now();
+        let resp = match authed
             .broadcast_transaction(BroadcastTransactionRequest {
                 identity_public_key: Bytes::copy_from_slice(issuer_pubkey),
                 partial_token_transaction: Some(partial_tx),
@@ -354,11 +425,17 @@ where
                 }],
             })
             .await
-            .map_err(|e| {
+        {
+            Ok(r) => r,
+            Err(e) => {
                 error!("mint_token broadcast failed: {e}");
-                SdkError::TransportFailed
-            })?;
+                return Err(tracker.fail(OperationStep::TokenBroadcast, SdkError::TransportFailed));
+            }
+        };
+        tracker.step_ok(OperationStep::TokenBroadcast, t.elapsed());
 
+        info!(op_id = %op_id, recipients = outputs.len(), "tokens minted");
+        tracker.succeed();
         Ok(MintTokenResult {
             final_tx: resp.final_token_transaction,
         })

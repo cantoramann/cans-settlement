@@ -289,6 +289,43 @@ where
         &self.inner.config.retry_policy
     }
 
+    /// Query a tracked operation by ID.
+    ///
+    /// Returns `None` if the operation was not found (e.g. using
+    /// [`tracking::NoopOperationStore`]).
+    pub fn query_operation(
+        &self,
+        id: tracking::OperationId,
+    ) -> Option<tracking::Operation> {
+        self.operation_store().get(id)
+    }
+
+    /// List all in-progress operations.
+    pub fn active_operations(&self) -> Vec<tracking::Operation> {
+        self.operation_store().list_active()
+    }
+
+    /// Resume a previously failed or partially-completed claim.
+    ///
+    /// This is a convenience method: it simply re-invokes `claim_transfer`
+    /// which is already idempotent (the coordinator tracks which transfers
+    /// are pending vs. already claimed). Transfers that were claimed on
+    /// the prior attempt won't be re-claimed.
+    ///
+    /// For swap resume, the coordinator's transfer state determines what
+    /// happens -- if the outbound was already sent, re-claiming the
+    /// inbound is safe.
+    pub async fn resume_claim(
+        &self,
+        receiver_pubkey: &crate::wallet_store::IdentityPubKey,
+        signer: &impl signer::WalletSigner,
+    ) -> Result<
+        crate::operations::btc::claim::ClaimTransferResult,
+        tracking::OperationError,
+    > {
+        self.claim_transfer(receiver_pubkey, signer).await
+    }
+
     // -----------------------------------------------------------------------
     // Hook management
     // -----------------------------------------------------------------------

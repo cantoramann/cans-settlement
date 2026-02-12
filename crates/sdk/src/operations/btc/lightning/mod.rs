@@ -156,7 +156,7 @@ where
             }
 
             let spent_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
-            if let Err(_) = self.inner.tree_store.remove_leaves(&spent_ids) {
+            if self.inner.tree_store.remove_leaves(&spent_ids).is_err() {
                 return Err(tracker.fail(OperationStep::SspSwap, SdkError::StoreFailed));
             }
             tracker.step_ok(OperationStep::SspSwap, t.elapsed());
@@ -210,10 +210,11 @@ where
             return match result {
                 Ok(resp) => {
                     tracker.step_ok(OperationStep::HtlcSubmit, t.elapsed());
-                    if let Err(_) = self
+                    if self
                         .inner
                         .tree_store
                         .finalize_reservation(reservation.id, None)
+                        .is_err()
                     {
                         return Err(
                             tracker.fail(OperationStep::Finalization, SdkError::StoreFailed)
@@ -259,10 +260,11 @@ where
         match result {
             Ok(resp) => {
                 tracker.step_ok(OperationStep::HtlcSubmit, t.elapsed());
-                if let Err(_) = self
+                if self
                     .inner
                     .tree_store
                     .finalize_reservation(reservation.id, None)
+                    .is_err()
                 {
                     return Err(tracker.fail(OperationStep::Finalization, SdkError::StoreFailed));
                 }
