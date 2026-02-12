@@ -130,6 +130,9 @@ where
         for transfer in &pending.transfers {
             self.check_cancelled()?;
 
+            // Run pre-claim hook chain (no-op when empty).
+            self.inner.hooks.run_pre_claim(transfer).await?;
+
             let claimed = self
                 .claim_single_transfer(&authed, transfer, receiver_pubkey, signer)
                 .await?;

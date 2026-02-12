@@ -53,6 +53,7 @@
 pub mod bitcoin_tx;
 pub mod error;
 pub mod frost_bridge;
+pub mod hooks;
 pub mod network;
 pub mod operations;
 pub mod ssp;
@@ -69,6 +70,7 @@ use config::NetworkConfig;
 use tokio_util::sync::CancellationToken;
 use transport::grpc::{AuthenticatedTransport, GrpcConfig, GrpcTransport, OperatorConfig};
 
+use crate::hooks::{Hook, HookPoint, Hooks};
 use crate::ssp::SspClient;
 use crate::token::TokenStore;
 use crate::tree::TreeStore;
@@ -93,6 +95,7 @@ pub struct SdkConfig {
 pub(crate) struct SdkInner<W, T, K, S> {
     pub config: SdkConfig,
     pub transport: GrpcTransport,
+    pub hooks: Hooks,
     pub wallet_store: W,
     pub tree_store: T,
     pub token_store: K,
@@ -175,6 +178,7 @@ where
             inner: Arc::new(SdkInner {
                 config,
                 transport,
+                hooks: Hooks::new(),
                 wallet_store,
                 tree_store,
                 token_store,
@@ -240,5 +244,42 @@ where
             .transport
             .authenticated(&token)
             .map_err(|_| SdkError::AuthFailed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Hook management
+    // -----------------------------------------------------------------------
+
+    /// Register a named hook at the given operation point.
+    ///
+    /// If a hook with the same `name` already exists at that point, it is
+    /// replaced in-place (preserving execution order). Otherwise the hook
+    /// is appended to the end of the chain.
+    ///
+    /// Hooks can be added and removed at any time without recompilation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use sdk::hooks::{Hook, HookPoint};
+    ///
+    /// sdk.add_hook(HookPoint::PreClaim, "sparkscan", Hook::PreClaim(Arc::new(validator)));
+    /// ```
+    pub async fn add_hook(&self, point: HookPoint, name: &'static str, hook: Hook) {
+        match (point, hook) {
+            (HookPoint::PreClaim, Hook::PreClaim(h)) => {
+                self.inner.hooks.add_pre_claim(name, h).await;
+            }
+        }
+    }
+
+    /// Remove a named hook from the given operation point.
+    ///
+    /// Returns `true` if a hook with that name was found and removed.
+    pub async fn remove_hook(&self, point: HookPoint, name: &'static str) -> bool {
+        match point {
+            HookPoint::PreClaim => self.inner.hooks.remove_pre_claim(name).await,
+        }
     }
 }

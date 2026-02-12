@@ -59,6 +59,9 @@ pub enum SdkError {
 
     /// The SSP returned an unexpected or invalid response.
     SspInvalidResponse,
+
+    /// A registered hook rejected the operation.
+    HookRejected,
 }
 
 impl fmt::Display for SdkError {
@@ -80,6 +83,7 @@ impl fmt::Display for SdkError {
             Self::OperationFailed => write!(f, "operation failed"),
             Self::SspSwapFailed => write!(f, "SSP swap failed"),
             Self::SspInvalidResponse => write!(f, "invalid SSP response"),
+            Self::HookRejected => write!(f, "hook rejected operation"),
         }
     }
 }
