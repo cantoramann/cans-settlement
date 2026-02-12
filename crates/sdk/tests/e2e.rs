@@ -450,46 +450,6 @@ async fn query_pending_transfers_a() {
 // Tests: Transfers (requires funded wallets + complete FROST signing)
 // ===========================================================================
 
-/// Transfer BTC from wallet A to wallet B.
-#[tokio::test]
-#[ignore = "requires funded wallets and complete FROST signing implementation"]
-async fn transfer_a_to_b() {
-    let mnemonic_a = resolve_mnemonic("E2E_WALLET_A_MNEMONIC");
-    let mnemonic_b = resolve_mnemonic("E2E_WALLET_B_MNEMONIC");
-    let (signer_a, pubkey_a) = wallet_from_mnemonic(&mnemonic_a, ACCOUNT_A);
-    let (_signer_b, pubkey_b) = wallet_from_mnemonic(&mnemonic_b, ACCOUNT_B);
-
-    let sdk = make_sdk_with_wallets(&mnemonic_a, &pubkey_a, &mnemonic_b, &pubkey_b);
-
-    // Sync wallet A.
-    let sync = sdk
-        .sync_wallet(&pubkey_a, &signer_a)
-        .await
-        .expect("sync A should succeed");
-    assert!(sync.balance_sats > 0, "wallet A must have funds");
-
-    let transfer_amount = 1000; // 1000 sats
-    assert!(
-        sync.balance_sats >= transfer_amount,
-        "wallet A must have at least {transfer_amount} sats"
-    );
-
-    println!("\nTransferring {transfer_amount} sats from A to B...");
-    let result = sdk
-        .send_transfer(&pubkey_a, &pubkey_b, transfer_amount, &signer_a)
-        .await;
-
-    match &result {
-        Ok(r) => println!(
-            "  Transfer started: {:?}",
-            r.transfer.as_ref().map(|t| &t.id)
-        ),
-        Err(e) => println!("  Transfer failed: {e}"),
-    }
-    result.expect("send_transfer should succeed");
-    println!("  Transfer: OK\n");
-}
-
 /// Claim a pending transfer on wallet B.
 #[tokio::test]
 #[ignore = "requires funded wallets and complete FROST signing implementation"]

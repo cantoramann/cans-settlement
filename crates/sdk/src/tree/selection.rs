@@ -1,42 +1,77 @@
-//! Greedy leaf selection algorithm.
+//! Leaf selection strategies.
 //!
-//! Selects the smallest set of leaves whose total value meets or exceeds
-//! the target amount. Leaves are sorted descending by value, and the
-//! algorithm picks greedily.
+//! [`LeafSelector`] is the trait that all selection algorithms implement.
+//! The SDK stores the active strategy as `Arc<dyn LeafSelector>` and
+//! delegates all leaf picking to it. Strategies can be swapped at runtime
+//! via [`crate::Sdk::set_leaf_selector`].
+//!
+//! # Built-in strategies
+//!
+//! - [`GreedySelector`]: Largest-first greedy pick (default).
 
 use super::store::TreeNode;
 
-/// Select leaves to cover `target_sats` using a greedy algorithm.
+// ---------------------------------------------------------------------------
+// LeafSelector trait
+// ---------------------------------------------------------------------------
+
+/// Strategy for selecting leaves to cover a target amount.
 ///
-/// Sorts available leaves descending by value and accumulates until the
-/// target is met. Returns the selected leaves and the total value.
+/// Implementations receive the full set of available (non-reserved) leaves
+/// and the target satoshi amount. They return the selected subset and the
+/// total value, or `None` if the target cannot be met.
 ///
-/// Returns `None` if the available leaves cannot cover the target.
-pub fn select_leaves_greedy(
-    available: &[TreeNode],
-    target_sats: u64,
-) -> Option<(Vec<&TreeNode>, u64)> {
-    if target_sats == 0 {
-        return Some((Vec::new(), 0));
-    }
+/// Stateful strategies (e.g., FIFO with retry tracking) can use interior
+/// mutability (`RwLock`, `AtomicU64`, etc.) since the method takes `&self`.
+pub trait LeafSelector: Send + Sync {
+    /// Select leaves whose total value meets or exceeds `target_sats`.
+    ///
+    /// Returns `None` if the available leaves cannot cover the target.
+    fn select<'a>(
+        &self,
+        available: &'a [TreeNode],
+        target_sats: u64,
+    ) -> Option<(Vec<&'a TreeNode>, u64)>;
+}
 
-    // Sort indices by value descending.
-    let mut indices: Vec<usize> = (0..available.len()).collect();
-    indices.sort_unstable_by(|&a, &b| available[b].value.cmp(&available[a].value));
+// ---------------------------------------------------------------------------
+// GreedySelector
+// ---------------------------------------------------------------------------
 
-    let mut selected = Vec::new();
-    let mut total = 0u64;
+/// Largest-first greedy selection. Stateless, zero-sized.
+///
+/// Sorts leaves descending by value and accumulates until the target is
+/// met. Minimizes the number of leaves used but may overshoot the target.
+pub struct GreedySelector;
 
-    for &idx in &indices {
-        selected.push(&available[idx]);
-        total += available[idx].value;
-        if total >= target_sats {
-            return Some((selected, total));
+impl LeafSelector for GreedySelector {
+    fn select<'a>(
+        &self,
+        available: &'a [TreeNode],
+        target_sats: u64,
+    ) -> Option<(Vec<&'a TreeNode>, u64)> {
+        if target_sats == 0 {
+            return Some((Vec::new(), 0));
         }
-    }
 
-    // Not enough balance.
-    None
+        // Sort indices by value descending.
+        let mut indices: Vec<usize> = (0..available.len()).collect();
+        indices.sort_unstable_by(|&a, &b| available[b].value.cmp(&available[a].value));
+
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+
+        for &idx in &indices {
+            selected.push(&available[idx]);
+            total += available[idx].value;
+            if total >= target_sats {
+                return Some((selected, total));
+            }
+        }
+
+        // Not enough balance.
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,44 +105,50 @@ mod tests {
 
     #[test]
     fn select_zero_returns_empty() {
+        let selector = GreedySelector;
         let leaves = vec![leaf("a", 100)];
-        let (selected, total) = select_leaves_greedy(&leaves, 0).unwrap();
+        let (selected, total) = selector.select(&leaves, 0).unwrap();
         assert!(selected.is_empty());
         assert_eq!(total, 0);
     }
 
     #[test]
     fn select_exact_match() {
+        let selector = GreedySelector;
         let leaves = vec![leaf("a", 100), leaf("b", 200)];
-        let (selected, total) = select_leaves_greedy(&leaves, 200).unwrap();
+        let (selected, total) = selector.select(&leaves, 200).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(total, 200);
     }
 
     #[test]
     fn select_multiple_leaves() {
+        let selector = GreedySelector;
         let leaves = vec![leaf("a", 50), leaf("b", 60), leaf("c", 40)];
-        let (selected, total) = select_leaves_greedy(&leaves, 100).unwrap();
+        let (selected, total) = selector.select(&leaves, 100).unwrap();
         assert!(total >= 100);
         assert!(selected.len() <= 3);
     }
 
     #[test]
     fn select_insufficient_returns_none() {
+        let selector = GreedySelector;
         let leaves = vec![leaf("a", 50)];
-        assert!(select_leaves_greedy(&leaves, 100).is_none());
+        assert!(selector.select(&leaves, 100).is_none());
     }
 
     #[test]
     fn select_empty_returns_none() {
+        let selector = GreedySelector;
         let leaves: Vec<TreeNode> = vec![];
-        assert!(select_leaves_greedy(&leaves, 1).is_none());
+        assert!(selector.select(&leaves, 1).is_none());
     }
 
     #[test]
     fn select_prefers_largest_first() {
+        let selector = GreedySelector;
         let leaves = vec![leaf("a", 10), leaf("b", 100), leaf("c", 50)];
-        let (selected, total) = select_leaves_greedy(&leaves, 100).unwrap();
+        let (selected, total) = selector.select(&leaves, 100).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(total, 100);
         assert_eq!(selected[0].id, "b");

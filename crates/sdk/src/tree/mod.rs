@@ -8,5 +8,5 @@ mod selection;
 mod store;
 
 pub use memory::InMemoryTreeStore;
-pub use selection::select_leaves_greedy;
+pub use selection::{GreedySelector, LeafSelector};
 pub use store::{LeafReservation, ReservationId, SigningKeyshare, TreeNode, TreeStore};

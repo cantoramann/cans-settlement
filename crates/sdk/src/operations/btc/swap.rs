@@ -2,7 +2,7 @@
 //!
 //! # SSP Swap Flow
 //!
-//! When `select_leaves_greedy` picks leaves whose total exceeds the
+//! When the leaf selector picks leaves whose total exceeds the
 //! transfer amount, the excess must be returned as change.  Spark leaves
 //! are indivisible, so we swap them through the SSP:
 //!

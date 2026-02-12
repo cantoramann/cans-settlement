@@ -36,7 +36,7 @@ mod signing;
 use signer::WalletSigner;
 
 use crate::network::bitcoin_network;
-use crate::tree::{TreeStore, select_leaves_greedy};
+use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
 
@@ -91,9 +91,10 @@ where
         let network = bitcoin_network(self.inner.config.network.network);
 
         // 1. Select and reserve leaves.
+        let selector = self.leaf_selector();
         let available = self.inner.tree_store.get_available_leaves()?;
         let (selected, total) =
-            select_leaves_greedy(&available, amount_sats).ok_or(SdkError::InsufficientBalance)?;
+            selector.select(&available, amount_sats).ok_or(SdkError::InsufficientBalance)?;
 
         let change = total - amount_sats;
 
@@ -118,7 +119,8 @@ where
 
             // Re-select from the freshly claimed leaves.
             let refreshed = self.inner.tree_store.get_available_leaves()?;
-            let (re_selected, _re_total) = select_leaves_greedy(&refreshed, amount_sats)
+            let (re_selected, _re_total) = selector
+                .select(&refreshed, amount_sats)
                 .ok_or(SdkError::InsufficientBalance)?;
 
             let leaf_ids: Vec<&str> = re_selected.iter().map(|l| l.id.as_str()).collect();

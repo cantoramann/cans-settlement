@@ -73,7 +73,7 @@ use transport::grpc::{AuthenticatedTransport, GrpcConfig, GrpcTransport, Operato
 use crate::hooks::{Hook, HookPoint, Hooks};
 use crate::ssp::SspClient;
 use crate::token::TokenStore;
-use crate::tree::TreeStore;
+use crate::tree::{GreedySelector, LeafSelector, TreeStore};
 use crate::wallet_store::WalletStore;
 
 // ---------------------------------------------------------------------------
@@ -96,6 +96,7 @@ pub(crate) struct SdkInner<W, T, K, S> {
     pub config: SdkConfig,
     pub transport: GrpcTransport,
     pub hooks: Hooks,
+    pub leaf_selector: std::sync::RwLock<Arc<dyn LeafSelector>>,
     pub wallet_store: W,
     pub tree_store: T,
     pub token_store: K,
@@ -179,6 +180,7 @@ where
                 config,
                 transport,
                 hooks: Hooks::new(),
+                leaf_selector: std::sync::RwLock::new(Arc::new(GreedySelector)),
                 wallet_store,
                 tree_store,
                 token_store,
@@ -281,5 +283,36 @@ where
         match point {
             HookPoint::PreClaim => self.inner.hooks.remove_pre_claim(name).await,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Leaf selection
+    // -----------------------------------------------------------------------
+
+    /// Replace the leaf selection strategy at runtime.
+    ///
+    /// The new strategy takes effect for all subsequent operations.
+    /// In-flight operations that already cloned the previous strategy
+    /// will complete with the old one.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use sdk::tree::GreedySelector;
+    ///
+    /// sdk.set_leaf_selector(Arc::new(GreedySelector));
+    /// ```
+    pub fn set_leaf_selector(&self, selector: Arc<dyn LeafSelector>) {
+        *self.inner.leaf_selector.write().unwrap() = selector;
+    }
+
+    /// Get the current leaf selector (cheap `Arc` clone).
+    ///
+    /// The read lock is held only long enough to clone the `Arc`.
+    /// Operations call `.select()` on the returned handle outside
+    /// the lock.
+    pub(crate) fn leaf_selector(&self) -> Arc<dyn LeafSelector> {
+        self.inner.leaf_selector.read().unwrap().clone()
     }
 }

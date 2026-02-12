@@ -14,7 +14,7 @@
 use signer::WalletSigner;
 use transport::spark;
 
-use crate::tree::{TreeStore, select_leaves_greedy};
+use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};
 
@@ -50,9 +50,11 @@ where
         let authed = self.authenticate(signer).await?;
 
         // 1. Select and reserve leaves.
+        let selector = self.leaf_selector();
         let available = self.inner.tree_store.get_available_leaves()?;
-        let (selected, _total) =
-            select_leaves_greedy(&available, amount_sats).ok_or(SdkError::InsufficientBalance)?;
+        let (selected, _total) = selector
+            .select(&available, amount_sats)
+            .ok_or(SdkError::InsufficientBalance)?;
 
         let leaf_ids: Vec<&str> = selected.iter().map(|l| l.id.as_str()).collect();
         let reservation = self.inner.tree_store.reserve_leaves(&leaf_ids)?;
