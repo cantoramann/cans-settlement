@@ -470,7 +470,23 @@ pub(crate) const TIMELOCK_MASK: u32 = 0x0000_FFFF;
 pub(crate) const TIME_LOCK_INTERVAL: u16 = 100;
 pub(crate) const DIRECT_TIME_LOCK_OFFSET: u16 = 50;
 
+// HTLC sequence offsets (match Spark Go SDK).
+pub(crate) const HTLC_SEQUENCE_OFFSET: u16 = 30;
+pub(crate) const DIRECT_HTLC_SEQUENCE_OFFSET: u16 = 15;
+
+/// Round a timelock value down to the nearest `TIME_LOCK_INTERVAL` boundary.
+///
+/// The coordinator applies this rounding before computing expected sequences,
+/// so the client must do the same to match.
+fn round_down_to_interval(timelock: u16) -> u16 {
+    timelock - (timelock % TIME_LOCK_INTERVAL)
+}
+
 /// Compute the next (decremented) sequences for a send transfer.
+///
+/// The timelock is first rounded down to a `TIME_LOCK_INTERVAL`-aligned value,
+/// then decremented by `TIME_LOCK_INTERVAL`. This matches the coordinator's
+/// `RoundDownToTimelockInterval` + decrement behaviour.
 ///
 /// Returns `(cpfp_sequence, direct_sequence)`.
 /// Returns `None` if the timelock is already too low to decrement.
@@ -479,12 +495,35 @@ pub(crate) fn next_send_sequence(
 ) -> Option<(bitcoin::Sequence, bitcoin::Sequence)> {
     let raw = current_cpfp_seq.to_consensus_u32();
     let timelock = (raw & TIMELOCK_MASK) as u16;
-    let next_timelock = timelock.checked_sub(TIME_LOCK_INTERVAL)?;
+    let rounded = round_down_to_interval(timelock);
+    let next_timelock = rounded.checked_sub(TIME_LOCK_INTERVAL)?;
     let flags = raw & !TIMELOCK_MASK;
     let cpfp = bitcoin::Sequence::from_consensus(flags | u32::from(next_timelock));
     let direct = bitcoin::Sequence::from_consensus(
         flags | u32::from(next_timelock + DIRECT_TIME_LOCK_OFFSET),
     );
+    Some((cpfp, direct))
+}
+
+/// Compute the next HTLC sequences for a Lightning preimage swap.
+///
+/// The timelock is first rounded down to a `TIME_LOCK_INTERVAL`-aligned
+/// value, then the HTLC-specific offset is subtracted. This matches the
+/// coordinator's server-side computation for HTLC refund validation.
+///
+/// Returns `(cpfp_htlc_sequence, direct_htlc_sequence)`.
+/// Returns `None` if the timelock is already too low.
+pub(crate) fn next_htlc_sequence(
+    current_cpfp_seq: bitcoin::Sequence,
+) -> Option<(bitcoin::Sequence, bitcoin::Sequence)> {
+    let raw = current_cpfp_seq.to_consensus_u32();
+    let timelock = (raw & TIMELOCK_MASK) as u16;
+    let rounded = round_down_to_interval(timelock);
+    let flags = raw & !TIMELOCK_MASK;
+    let cpfp_tl = rounded.checked_sub(HTLC_SEQUENCE_OFFSET)?;
+    let direct_tl = rounded.checked_sub(DIRECT_HTLC_SEQUENCE_OFFSET)?;
+    let cpfp = bitcoin::Sequence::from_consensus(flags | u32::from(cpfp_tl));
+    let direct = bitcoin::Sequence::from_consensus(flags | u32::from(direct_tl));
     Some((cpfp, direct))
 }
 

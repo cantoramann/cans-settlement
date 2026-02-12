@@ -152,6 +152,162 @@ pub fn create_direct_refund_tx(
 }
 
 // ---------------------------------------------------------------------------
+// Lightning HTLC Refund Transactions
+// ---------------------------------------------------------------------------
+
+/// BIP-341 NUMS (Nothing-Up-My-Sleeve) point -- no known discrete log.
+/// Used as the internal key for HTLC taproot outputs to disable key-path spends.
+const NUMS_POINT_BYTES: [u8; 33] = [
+    0x02, 0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a,
+    0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a,
+    0xc0,
+];
+
+/// CSV sequence for the sender's reclaim path in the HTLC output (2160 blocks).
+pub const LIGHTNING_HTLC_SEQUENCE: u32 = 2160;
+
+/// Build the hash-lock tapscript leaf: `OP_SHA256 <hash> OP_EQUALVERIFY <xonly> OP_CHECKSIG`
+fn hash_lock_script(payment_hash: &[u8; 32], receiver_xonly: &XOnlyPublicKey) -> ScriptBuf {
+    bitcoin::script::Builder::new()
+        .push_opcode(bitcoin::opcodes::all::OP_SHA256)
+        .push_slice(payment_hash)
+        .push_opcode(bitcoin::opcodes::all::OP_EQUALVERIFY)
+        .push_x_only_key(receiver_xonly)
+        .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+        .into_script()
+}
+
+/// Build the sequence-lock tapscript leaf: `<seq> OP_CSV OP_DROP <xonly> OP_CHECKSIG`
+fn sequence_lock_script(csv_blocks: u32, sender_xonly: &XOnlyPublicKey) -> ScriptBuf {
+    bitcoin::script::Builder::new()
+        .push_int(i64::from(csv_blocks))
+        .push_opcode(bitcoin::opcodes::all::OP_CSV)
+        .push_opcode(bitcoin::opcodes::all::OP_DROP)
+        .push_x_only_key(sender_xonly)
+        .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+        .into_script()
+}
+
+/// Compute the HTLC taproot `ScriptBuf` for an HTLC output.
+///
+/// The taproot tree has two leaves:
+///   - Hash-lock: receiver claims by revealing the SHA256 preimage
+///   - Sequence-lock: sender reclaims after `LIGHTNING_HTLC_SEQUENCE` blocks
+///
+/// The internal key is the NUMS point (key-path unspendable).
+pub fn htlc_script_pubkey(
+    payment_hash: &[u8; 32],
+    receiver_xonly: &XOnlyPublicKey,
+    sender_xonly: &XOnlyPublicKey,
+    network: Network,
+) -> ScriptBuf {
+    use bitcoin::taproot::TaprootBuilder;
+
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let nums_xonly =
+        XOnlyPublicKey::from_slice(&NUMS_POINT_BYTES[1..]).expect("hardcoded NUMS point is valid");
+
+    let hl = hash_lock_script(payment_hash, receiver_xonly);
+    let sl = sequence_lock_script(LIGHTNING_HTLC_SEQUENCE, sender_xonly);
+
+    // Match Go's AssembleTaprootScriptTree(hashLockLeaf, sequenceLockLeaf) order.
+    // BIP-341 TapBranch sorts children by hash, so leaf order at the same depth
+    // does NOT affect the output key.
+    let builder = TaprootBuilder::new()
+        .add_leaf(1, hl)
+        .expect("valid leaf")
+        .add_leaf(1, sl)
+        .expect("valid leaf");
+
+    let spend_info = builder
+        .finalize(&secp, nums_xonly)
+        .expect("valid taproot tree");
+
+    let address = Address::p2tr_tweaked(spend_info.output_key(), network);
+    address.script_pubkey()
+}
+
+/// Create a **CPFP HTLC** refund transaction (2 outputs: HTLC P2TR + P2A anchor).
+///
+/// Identical to [`create_cpfp_refund_tx`] except the P2TR output pays to an
+/// HTLC taproot address (hash-lock + sequence-lock) instead of a plain P2TR.
+pub fn create_cpfp_htlc_refund_tx(
+    prev_txid: Txid,
+    prev_vout: u32,
+    value: Amount,
+    sequence: Sequence,
+    payment_hash: &[u8; 32],
+    receiver_xonly: &XOnlyPublicKey,
+    sender_xonly: &XOnlyPublicKey,
+    network: Network,
+) -> Transaction {
+    let htlc_spk = htlc_script_pubkey(payment_hash, receiver_xonly, sender_xonly, network);
+
+    // BIP-431 ephemeral anchor.
+    let anchor_script = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]);
+
+    Transaction {
+        version: bitcoin::transaction::Version::non_standard(3),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(prev_txid, prev_vout),
+            script_sig: ScriptBuf::new(),
+            sequence,
+            witness: Witness::default(),
+        }],
+        output: vec![
+            TxOut {
+                value,
+                script_pubkey: htlc_spk,
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: anchor_script,
+            },
+        ],
+    }
+}
+
+/// Create a **direct HTLC** refund transaction (1 output: HTLC P2TR, no anchor).
+///
+/// Identical to [`create_direct_refund_tx`] except the output pays to an HTLC
+/// taproot address.
+pub fn create_direct_htlc_refund_tx(
+    prev_txid: Txid,
+    prev_vout: u32,
+    value: Amount,
+    sequence: Sequence,
+    payment_hash: &[u8; 32],
+    receiver_xonly: &XOnlyPublicKey,
+    sender_xonly: &XOnlyPublicKey,
+    network: Network,
+) -> Transaction {
+    let htlc_spk = htlc_script_pubkey(payment_hash, receiver_xonly, sender_xonly, network);
+
+    let raw = value.to_sat();
+    let output_sats = if raw > DEFAULT_FEE_SATS {
+        raw - DEFAULT_FEE_SATS
+    } else {
+        raw
+    };
+
+    Transaction {
+        version: bitcoin::transaction::Version::non_standard(3),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(prev_txid, prev_vout),
+            script_sig: ScriptBuf::new(),
+            sequence,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(output_sats),
+            script_pubkey: htlc_spk,
+        }],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Taproot Sighash
 // ---------------------------------------------------------------------------
 

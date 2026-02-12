@@ -21,6 +21,6 @@ pub use claim::ClaimTransferResult;
 pub use deposit::DepositAddress;
 pub use events::SparkEvent;
 pub use exit::CooperativeExitResult;
-pub use lightning::{CreateInvoiceResult, PayInvoiceResult};
+pub use lightning::{CreateInvoiceResult, GeneratePreimageResult, PayInvoiceResult};
 pub use sync::SyncResult;
 pub use transfer::SendTransferResult;

@@ -1119,3 +1119,234 @@ async fn token_create_mint_send_to_self() {
 
     println!("\n==========================================================\n");
 }
+
+// ===========================================================================
+// Tests: Lightning (requires network + funding-client faucet)
+// ===========================================================================
+
+/// End-to-end Lightning round-trip: create_invoice (B) -> pay_invoice (A).
+///
+/// 1. Fund wallet A via faucet
+/// 2. Claim the funding transfer
+/// 3. Wallet B: create_invoice -> store preimage shares -> get payment_hash
+/// 4. Build a BOLT11 invoice from the payment_hash using lightning-invoice
+/// 5. Wallet A: pay_invoice with the payment_hash, B as receiver
+/// 6. Assert the preimage is returned and SHA256(preimage) == payment_hash
+/// 7. Wallet B: claim the transfer
+/// 8. Verify B has a positive balance
+///
+/// Run:
+/// ```bash
+/// cargo test -p sdk --test e2e lightning_create_and_pay -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires network access and funding-client faucet"]
+async fn lightning_create_and_pay() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("sdk=debug,transport=debug")
+        .with_test_writer()
+        .try_init();
+
+    // ---- Wallet A (sender): fund via faucet ----
+    let mnemonic_a = resolve_mnemonic("E2E_WALLET_A_MNEMONIC");
+    let (signer_a, pubkey_a) = wallet_from_mnemonic(&mnemonic_a, ACCOUNT_A);
+    let spark_address_a = encode_spark_address(Network::Regtest, &pubkey_a);
+
+    // ---- Wallet B (receiver): create invoice ----
+    let mnemonic_b = resolve_mnemonic("E2E_WALLET_B_MNEMONIC");
+    let (signer_b, pubkey_b) = wallet_from_mnemonic(&mnemonic_b, ACCOUNT_B);
+
+    // SDK for A (with SSP, in case we need swap for exact amount).
+    let sdk_a = make_sdk_with_ssp(&mnemonic_a, &pubkey_a, ACCOUNT_A);
+
+    // SDK for B (no SSP needed -- just create_invoice and claim).
+    let sdk_b = make_sdk_with_wallet(&mnemonic_b, &pubkey_b, ACCOUNT_B);
+
+    println!("\n========== Lightning: create_invoice (B) -> pay_invoice (A) ==========");
+    println!("  Wallet A (sender):   {}", hex_encode(&pubkey_a));
+    println!("  Wallet B (receiver): {}", hex_encode(&pubkey_b));
+    println!("  Spark address A:     {spark_address_a}");
+
+    // -----------------------------------------------------------------
+    // Step 1: Fund wallet A
+    // -----------------------------------------------------------------
+    let funding_amount = 1_000u64;
+    println!("\n  [Step 1] Requesting {funding_amount} sats from faucet for A...");
+
+    let faucet = funding_client::FundingClient::new().await;
+    let fund_results = faucet
+        .request_funds(vec![funding_client::FundingTask {
+            amount_sats: funding_amount,
+            recipient: spark_address_a,
+        }])
+        .await
+        .expect("funding request should succeed");
+
+    assert_eq!(fund_results.len(), 1);
+    println!(
+        "    Funded: {} sats, status: {}, txids: {:?}",
+        fund_results[0].amount_sent, fund_results[0].status, fund_results[0].txids
+    );
+
+    // -----------------------------------------------------------------
+    // Step 2: Wait + claim the funding transfer
+    // -----------------------------------------------------------------
+    println!("\n  [Step 2] Waiting 10s for propagation, then claiming...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    let claim_result = sdk_a
+        .claim_transfer(&pubkey_a, &signer_a)
+        .await
+        .expect("A: claim should succeed");
+    println!("    A claimed: {} leaves", claim_result.leaves_claimed);
+    assert!(claim_result.leaves_claimed > 0);
+
+    let balance_a = sdk_a
+        .query_balance(&pubkey_a)
+        .await
+        .expect("A: balance query should succeed");
+    println!("    A balance: {} sats", balance_a.btc_available_sats);
+    assert!(balance_a.btc_available_sats > 0);
+
+    // -----------------------------------------------------------------
+    // Step 3: Wallet B generates preimage + builds BOLT11 + stores shares
+    // -----------------------------------------------------------------
+    println!("\n  [Step 3] B: generate preimage + build BOLT11 + store shares...");
+
+    let pay_amount = 500u64;
+
+    // 3a. Generate preimage and payment_hash.
+    let preimage_result = sdk_b.generate_payment_preimage();
+    let payment_hash = preimage_result.payment_hash;
+    println!("    Payment hash: {}", hex_encode(&payment_hash));
+
+    // 3b. Build a BOLT11 invoice from the payment_hash.
+    let bolt11 = build_test_bolt11(&payment_hash, pay_amount);
+    println!(
+        "    BOLT11: {}...{}",
+        &bolt11[..30],
+        &bolt11[bolt11.len() - 10..]
+    );
+
+    // 3c. Store preimage shares with all operators.
+    let invoice_result = match sdk_b
+        .create_invoice(&pubkey_b, &preimage_result.preimage, &bolt11, &signer_b)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => panic!("B: create_invoice failed: {e:?}"),
+    };
+    println!(
+        "    Shares stored, hash: {}",
+        hex_encode(&invoice_result.payment_hash)
+    );
+
+    // -----------------------------------------------------------------
+    // Step 4: Wallet A pays the invoice
+    // -----------------------------------------------------------------
+    println!("\n  [Step 4] A: pay_invoice ({pay_amount} sats to B)...");
+    let pay_result = sdk_a
+        .pay_invoice(
+            &pubkey_a,
+            &payment_hash,
+            pay_amount,
+            &pubkey_b,
+            &bolt11,
+            &signer_a,
+        )
+        .await
+        .expect("A: pay_invoice should succeed");
+
+    println!("    Preimage returned: {}", pay_result.preimage.is_some());
+    println!(
+        "    Transfer ID: {:?}",
+        pay_result.transfer.as_ref().map(|t| &t.id)
+    );
+
+    // If the coordinator revealed the preimage, verify it matches.
+    if let Some(preimage) = &pay_result.preimage {
+        use bitcoin::hashes::{Hash, sha256};
+        let computed_hash: [u8; 32] = *sha256::Hash::hash(preimage).as_byte_array();
+        assert_eq!(
+            computed_hash, payment_hash,
+            "SHA256(preimage) should equal the payment_hash"
+        );
+        println!("    Preimage verified: SHA256(preimage) == payment_hash");
+    }
+
+    // -----------------------------------------------------------------
+    // Step 5: Wallet B claims the transfer (retry up to 3 times)
+    // -----------------------------------------------------------------
+    println!("\n  [Step 5] B: claim transfer (with retries)...");
+    let mut b_claimed: usize = 0;
+    for attempt in 1..=3 {
+        println!("    Attempt {attempt}: waiting 5s...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let b_claim = sdk_b
+            .claim_transfer(&pubkey_b, &signer_b)
+            .await
+            .expect("B: claim should succeed");
+        b_claimed += b_claim.leaves_claimed;
+        println!(
+            "    Attempt {attempt}: claimed {} leaves (total: {b_claimed})",
+            b_claim.leaves_claimed
+        );
+        if b_claimed > 0 {
+            break;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Step 6: Verify final balances
+    // -----------------------------------------------------------------
+    let final_a = sdk_a
+        .query_balance(&pubkey_a)
+        .await
+        .expect("A: final balance");
+    let final_b = sdk_b
+        .query_balance(&pubkey_b)
+        .await
+        .expect("B: final balance");
+
+    println!("\n  [Step 6] Final balances:");
+    println!("    A: {} sats", final_a.btc_available_sats);
+    println!("    B: {} sats", final_b.btc_available_sats);
+
+    println!("\n=====================================================================\n");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a test BOLT11 invoice
+// ---------------------------------------------------------------------------
+
+/// Build a minimal BOLT11 invoice for testing using lightning-invoice.
+///
+/// This creates a syntactically valid invoice signed with an ephemeral key.
+/// Only the `payment_hash` and `amount_sats` matter for the preimage swap;
+/// the signing key is arbitrary (the coordinator validates the hash, not
+/// the invoice signature).
+fn build_test_bolt11(payment_hash: &[u8; 32], amount_sats: u64) -> String {
+    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder};
+
+    // Ephemeral key -- only used to sign the invoice encoding.
+    let sk = SecretKey::from_slice(&[0xab; 32]).expect("valid secret key");
+    let secp = Secp256k1::new();
+
+    let hash = sha256::Hash::from_byte_array(*payment_hash);
+    let payment_secret = lightning_types::payment::PaymentSecret([0u8; 32]);
+
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .description("e2e lightning test".into())
+        .payment_hash(hash)
+        .payment_secret(payment_secret)
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(144)
+        .amount_milli_satoshis(amount_sats * 1000)
+        .build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &sk))
+        .expect("invoice build should succeed");
+
+    invoice.to_string()
+}
