@@ -1882,6 +1882,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "transport",
 ]
 

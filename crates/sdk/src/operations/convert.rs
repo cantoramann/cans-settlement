@@ -3,8 +3,9 @@
 //! Centralizes conversion from transport-layer protobuf types to the
 //! SDK's domain types, avoiding duplication across operation modules.
 
-use transport::spark;
+use transport::{spark, spark_token};
 
+use crate::token::TokenOutput;
 use crate::tree::{SigningKeyshare, TreeNode};
 
 /// Converts a proto `TreeNode` to the SDK's `TreeNode`.
@@ -44,5 +45,37 @@ pub fn proto_to_tree_node(node: &spark::TreeNode) -> Option<TreeNode> {
             owner_public_key: owner_identity_public_key,
         },
         vout: node.vout,
+    })
+}
+
+/// Converts a proto `OutputWithPreviousTransactionData` to the SDK's `TokenOutput`.
+///
+/// Returns `None` if required fields are missing or malformed.
+pub fn proto_to_token_output(
+    output: &spark_token::TokenOutput,
+    entry: &spark_token::OutputWithPreviousTransactionData,
+) -> Option<TokenOutput> {
+    let owner_public_key: [u8; 33] = output.owner_public_key.as_ref().try_into().ok()?;
+
+    // token_identifier is optional in proto; skip outputs without it.
+    let token_id_bytes = output.token_identifier.as_ref()?;
+    let token_id: [u8; 32] = token_id_bytes.as_ref().try_into().ok()?;
+
+    // token_amount is a 16-byte big-endian uint128.
+    let amount_bytes: [u8; 16] = output.token_amount.as_ref().try_into().ok()?;
+    let amount = u128::from_be_bytes(amount_bytes);
+
+    let previous_transaction_hash: [u8; 32] =
+        entry.previous_transaction_hash.as_ref().try_into().ok()?;
+
+    Some(TokenOutput {
+        id: output.id.clone().unwrap_or_default(),
+        token_id,
+        amount,
+        owner_public_key,
+        previous_transaction_hash,
+        previous_transaction_vout: entry.previous_transaction_vout,
+        withdraw_bond_sats: output.withdraw_bond_sats.unwrap_or(0),
+        withdraw_relative_block_locktime: output.withdraw_relative_block_locktime.unwrap_or(0),
     })
 }

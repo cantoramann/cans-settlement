@@ -955,3 +955,167 @@ async fn ssp_swap_via_send() {
 
     println!("=================================================\n");
 }
+
+// ===========================================================================
+// Tests: Token Operations
+// ===========================================================================
+
+/// Token lifecycle: create -> mint to self -> sync -> transfer to self.
+///
+/// Uses a single wallet as both issuer and recipient. No funded BTC
+/// leaves are needed -- token ops only require ECDSA identity key
+/// signatures and the `broadcast_transaction` RPC.
+///
+/// ```bash
+/// cargo test -p sdk --test e2e token_create_mint_send_to_self -- --nocapture
+/// ```
+#[tokio::test]
+async fn token_create_mint_send_to_self() {
+    // Activate tracing so error!() lines in the SDK are visible.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("sdk=debug,transport=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mnemonic = resolve_mnemonic("E2E_WALLET_A_MNEMONIC");
+    let (signer, pubkey) = wallet_from_mnemonic(&mnemonic, ACCOUNT_A);
+    let sdk = make_sdk_with_wallet(&mnemonic, &pubkey, ACCOUNT_A);
+
+    println!("\n========== Token: Create -> Mint -> Send to Self ==========");
+    println!("  Wallet: {}", hex_encode(&pubkey));
+
+    // -----------------------------------------------------------------
+    // Step 1: Create token
+    // -----------------------------------------------------------------
+    println!("\n  [Step 1] Creating token...");
+    let create_params = sdk::operations::token::CreateTokenParams {
+        name: "SelfTestToken",
+        ticker: "STT",
+        decimals: 0,
+        max_supply: 1_000_000,
+        is_freezable: false,
+    };
+
+    let create_result = match sdk.create_token(&pubkey, &create_params, &signer).await {
+        Ok(r) => r,
+        Err(e) => panic!("create_token failed: {e:?}"),
+    };
+
+    let token_id_vec = create_result.token_identifier;
+    println!(
+        "    Token ID: {} ({} bytes)",
+        hex_encode(&token_id_vec),
+        token_id_vec.len()
+    );
+    assert!(
+        !token_id_vec.is_empty(),
+        "token_identifier must not be empty"
+    );
+
+    // -----------------------------------------------------------------
+    // Step 2: Mint 1000 tokens to self
+    // -----------------------------------------------------------------
+    println!("\n  [Step 2] Minting 1000 tokens to self...");
+    let mint_result = sdk
+        .mint_token(&pubkey, &token_id_vec, &[(pubkey, 1000)], &signer)
+        .await
+        .expect("mint_token should succeed");
+
+    println!(
+        "    Mint final_tx present: {}",
+        mint_result.final_tx.is_some()
+    );
+
+    // -----------------------------------------------------------------
+    // Step 3: Sync token outputs and verify balance
+    // -----------------------------------------------------------------
+    println!("\n  [Step 3] Syncing token outputs...");
+    let sync = sdk
+        .sync_tokens(&pubkey, &signer)
+        .await
+        .expect("sync_tokens should succeed");
+
+    println!(
+        "    Synced: {} outputs, {} token types",
+        sync.output_count, sync.token_types
+    );
+    assert!(sync.output_count > 0, "should have at least 1 output");
+
+    let balances = sdk
+        .query_token_balances(&pubkey)
+        .await
+        .expect("balance query should succeed");
+
+    println!("    Balances:");
+    for b in &balances {
+        println!("      {}: {}", hex_encode(&b.token_id), b.amount);
+    }
+    assert!(!balances.is_empty(), "should have token balances");
+
+    // Find our token's balance.
+    let mut tid_32 = [0u8; 32];
+    assert_eq!(token_id_vec.len(), 32, "token_id should be 32 bytes");
+    tid_32.copy_from_slice(&token_id_vec);
+
+    let our_balance = balances
+        .iter()
+        .find(|b| b.token_id == tid_32)
+        .expect("should find our token in balances");
+    println!("    Our token balance: {}", our_balance.amount);
+    assert_eq!(our_balance.amount, 1000, "should have 1000 tokens");
+
+    // -----------------------------------------------------------------
+    // Step 4: Send 200 tokens to self
+    // -----------------------------------------------------------------
+    println!("\n  [Step 4] Sending 200 tokens to self...");
+    let send_result = sdk
+        .send_token(&pubkey, &pubkey, &tid_32, 200, &signer)
+        .await
+        .expect("send_token should succeed");
+
+    println!(
+        "    Send final_tx present: {}",
+        send_result.final_tx.is_some()
+    );
+
+    // -----------------------------------------------------------------
+    // Step 5: Re-sync and verify balance is unchanged
+    //         (200 sent + 800 change = 1000 total, all to self)
+    // -----------------------------------------------------------------
+    println!("\n  [Step 5] Re-syncing after transfer...");
+    let sync2 = sdk
+        .sync_tokens(&pubkey, &signer)
+        .await
+        .expect("sync_tokens should succeed after send");
+
+    println!(
+        "    Synced: {} outputs, {} token types",
+        sync2.output_count, sync2.token_types
+    );
+
+    let balances2 = sdk
+        .query_token_balances(&pubkey)
+        .await
+        .expect("balance after send should succeed");
+
+    let our_balance2 = balances2
+        .iter()
+        .find(|b| b.token_id == tid_32)
+        .expect("token should still exist after self-send");
+    println!("    Balance after self-send: {}", our_balance2.amount);
+
+    // Self-send: total should remain 1000 (200 to self + 800 change).
+    assert_eq!(
+        our_balance2.amount, 1000,
+        "self-send should preserve total balance"
+    );
+
+    // Should now be 2 outputs: the 200 send + the 800 change.
+    assert!(
+        sync2.output_count >= 2,
+        "self-send should produce 2 outputs (send + change), got {}",
+        sync2.output_count
+    );
+
+    println!("\n==========================================================\n");
+}

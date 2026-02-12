@@ -29,7 +29,7 @@ use signer::WalletSigner;
 use transport::spark;
 
 use crate::bitcoin_tx::{compressed_to_xonly, serialize_tx, taproot_sighash};
-use crate::operations::transfer_core::{
+use crate::operations::btc::transfer_core::{
     BuildLeafParams, build_cpfp_signing_job, build_key_tweak_package,
     frost_sign_user_share_with_adaptor, generate_uuid_v4, hex_encode, one_hour_expiry,
     sign_transfer_package,
@@ -100,7 +100,7 @@ where
         let mut leaf_contexts = Vec::with_capacity(leaves.len());
 
         for leaf in leaves {
-            let ctx = crate::operations::transfer_core::build_leaf_context(
+            let ctx = crate::operations::btc::transfer_core::build_leaf_context(
                 &BuildLeafParams {
                     leaf_id: &leaf.id,
                     node_tx: &leaf.node_tx,

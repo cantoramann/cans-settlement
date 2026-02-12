@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use config::NetworkConfig;
-use sdk::tree::InMemoryTreeStore;
 use sdk::token::InMemoryTokenStore;
+use sdk::tree::InMemoryTreeStore;
 use sdk::wallet_store::{InMemoryWalletStore, WalletEntry, WalletStore};
 use sdk::{Sdk, SdkConfig};
 use signer::{SparkWalletSigner, WalletSigner};

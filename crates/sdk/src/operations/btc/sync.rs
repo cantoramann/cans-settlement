@@ -16,7 +16,7 @@ use bytes::Bytes;
 use signer::WalletSigner;
 use transport::spark;
 
-use super::convert::proto_to_tree_node;
+use crate::operations::convert::proto_to_tree_node;
 use crate::tree::TreeStore;
 use crate::wallet_store::{IdentityPubKey, WalletStore};
 use crate::{Sdk, SdkError};

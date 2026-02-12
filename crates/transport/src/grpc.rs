@@ -771,6 +771,42 @@ impl GrpcTransport {
             .map_err(grpc_status_to_error)
     }
 
+    /// Query token metadata on the coordinator.
+    pub async fn query_token_metadata(
+        &self,
+        request: crate::spark_token::QueryTokenMetadataRequest,
+    ) -> Result<crate::spark_token::QueryTokenMetadataResponse, GrpcError> {
+        self.spark_token_coordinator_client()
+            .query_token_metadata(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Query token transactions on the coordinator.
+    pub async fn query_token_transactions(
+        &self,
+        request: crate::spark_token::QueryTokenTransactionsRequest,
+    ) -> Result<crate::spark_token::QueryTokenTransactionsResponse, GrpcError> {
+        self.spark_token_coordinator_client()
+            .query_token_transactions(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Freeze (or unfreeze) tokens on the coordinator.
+    pub async fn freeze_tokens(
+        &self,
+        request: crate::spark_token::FreezeTokensRequest,
+    ) -> Result<crate::spark_token::FreezeTokensResponse, GrpcError> {
+        self.spark_token_coordinator_client()
+            .freeze_tokens(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
     // -- private helpers ----------------------------------------------------
 
     /// Finds an operator entry by ID.
@@ -1185,6 +1221,42 @@ impl<'a> AuthenticatedTransport<'a> {
     ) -> Result<crate::spark_token::QueryTokenOutputsResponse, GrpcError> {
         self.token_coordinator_client()
             .query_token_outputs(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Query token metadata on the coordinator.
+    pub async fn query_token_metadata(
+        &self,
+        request: crate::spark_token::QueryTokenMetadataRequest,
+    ) -> Result<crate::spark_token::QueryTokenMetadataResponse, GrpcError> {
+        self.token_coordinator_client()
+            .query_token_metadata(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Query token transactions on the coordinator.
+    pub async fn query_token_transactions(
+        &self,
+        request: crate::spark_token::QueryTokenTransactionsRequest,
+    ) -> Result<crate::spark_token::QueryTokenTransactionsResponse, GrpcError> {
+        self.token_coordinator_client()
+            .query_token_transactions(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(grpc_status_to_error)
+    }
+
+    /// Freeze (or unfreeze) tokens on the coordinator.
+    pub async fn freeze_tokens(
+        &self,
+        request: crate::spark_token::FreezeTokensRequest,
+    ) -> Result<crate::spark_token::FreezeTokensResponse, GrpcError> {
+        self.token_coordinator_client()
+            .freeze_tokens(request)
             .await
             .map(|r| r.into_inner())
             .map_err(grpc_status_to_error)

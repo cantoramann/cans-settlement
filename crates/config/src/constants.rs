@@ -44,6 +44,11 @@ pub const DEFAULT_WITHDRAW_BOND_SATS: u64 = 10_000;
 /// Default expected relative block locktime for withdrawals.
 pub const DEFAULT_WITHDRAW_RELATIVE_LOCKTIME: u64 = 1_000;
 
+/// Default validity duration for token transactions (seconds).
+///
+/// The server enforces a range of [1, 300] seconds.
+pub const DEFAULT_TOKEN_VALIDITY_DURATION_SECS: u64 = 60;
+
 #[cfg(test)]
 mod tests {
     use super::*;

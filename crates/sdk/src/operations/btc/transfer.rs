@@ -33,7 +33,7 @@ use transport::spark;
 use crate::bitcoin_tx::{compressed_to_xonly, create_direct_refund_tx, parse_tx, serialize_tx};
 use crate::frost_bridge::commitment_to_proto;
 use crate::network::bitcoin_network;
-use crate::operations::transfer_core::{
+use crate::operations::btc::transfer_core::{
     self, BuildLeafParams, LeafTransferContext, build_cpfp_signing_job, build_key_tweak_package,
     frost_sign_user_share, generate_uuid_v4, next_send_sequence, one_hour_expiry,
     sign_transfer_package,
