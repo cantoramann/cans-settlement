@@ -102,29 +102,43 @@ where
                     if let Some(ref transfer) = transfer_event.transfer {
                         let transfer_id = &transfer.id;
                         let leaves = transfer.leaves.len();
-                        info!(%transfer_id, leaves, "received transfer event, auto-claiming");
 
-                        let receiver_pk = &transfer.receiver_identity_public_key;
-                        if receiver_pk.len() == 33 {
-                            let mut pk = [0u8; 33];
-                            pk.copy_from_slice(receiver_pk);
-                            if self.inner.wallet_store.resolve(&pk).is_some() {
-                                match self.claim_transfer(&pk, signer).await {
-                                    Ok(result) => {
-                                        info!(%transfer_id, leaves = result.leaves_claimed, "auto-claim succeeded");
+                        // Skip SSP swap inbound transfers -- those are claimed
+                        // by `ssp_swap` itself via `claim_by_transfer_id`.
+                        // Auto-claiming them here would race the swap's own
+                        // claim and cause spurious failures.
+                        let ssp_pk = self.inner.ssp.identity_public_key().serialize();
+                        if transfer.sender_identity_public_key.as_ref() == ssp_pk.as_slice() {
+                            debug!(
+                                %transfer_id,
+                                leaves,
+                                "skipping SSP swap inbound (claimed by ssp_swap)"
+                            );
+                        } else {
+                            info!(%transfer_id, leaves, "received transfer event, auto-claiming");
+
+                            let receiver_pk = &transfer.receiver_identity_public_key;
+                            if receiver_pk.len() == 33 {
+                                let mut pk = [0u8; 33];
+                                pk.copy_from_slice(receiver_pk);
+                                if self.inner.wallet_store.resolve(&pk).is_some() {
+                                    match self.claim_transfer(&pk, signer).await {
+                                        Ok(result) => {
+                                            info!(%transfer_id, leaves = result.leaves_claimed, "auto-claim succeeded");
+                                        }
+                                        Err(op_err) => {
+                                            warn!(
+                                                %transfer_id,
+                                                op_id = %op_err.operation_id,
+                                                step = %op_err.failed_step,
+                                                error = %op_err.error,
+                                                "auto-claim failed"
+                                            );
+                                        }
                                     }
-                                    Err(op_err) => {
-                                        warn!(
-                                            %transfer_id,
-                                            op_id = %op_err.operation_id,
-                                            step = %op_err.failed_step,
-                                            error = %op_err.error,
-                                            "auto-claim failed"
-                                        );
-                                    }
+                                } else {
+                                    debug!(%transfer_id, "receiver not in wallet store, skipping");
                                 }
-                            } else {
-                                debug!(%transfer_id, "receiver not in wallet store, skipping");
                             }
                         }
                     }

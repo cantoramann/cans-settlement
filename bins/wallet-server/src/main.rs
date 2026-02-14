@@ -292,21 +292,49 @@ async fn main() {
         }
     };
 
-    // NOTE: We intentionally do NOT start the auto-claim event loop here.
+    // -----------------------------------------------------------------------
+    // Background auto-claim event loop
+    // -----------------------------------------------------------------------
     //
-    // The auto-claim loop (`subscribe_and_handle_events`) calls
-    // `claim_transfer` for every inbound `TransferEvent`.  During the
-    // chaos loop, every BTC send triggers an SSP swap which creates an
-    // inbound transfer that the swap itself claims via
-    // `claim_by_transfer_id`.  If the auto-claim loop is running, it
-    // races the swap's internal claim -- the auto-claim wins, the swap
-    // sees TransportFailed, and `send_transfer` reports a spurious error
-    // even though the wallet received the leaves.
-    //
-    // Since no external party is sending us BTC during the chaos run,
-    // there is nothing to auto-claim.  The faucet funds were already
-    // claimed above, and SSP swap inbound transfers are self-contained.
-    tracing::info!("auto-claim event loop disabled (SSP swap handles its own claims)");
+    // The event loop auto-claims incoming transfers. SSP swap inbound
+    // transfers are automatically skipped at the SDK level (events.rs
+    // compares sender_identity_public_key against the SSP's key), so they
+    // don't race with `ssp_swap`'s own `claim_by_transfer_id`.
+
+    let claim_sdk = sdk.clone();
+    let claim_cancel = cancel.clone();
+    tokio::spawn(async move {
+        tracing::info!("starting background auto-claim event loop");
+
+        loop {
+            if claim_cancel.is_cancelled() {
+                break;
+            }
+
+            match claim_sdk
+                .subscribe_and_handle_events(&pubkey, &signer)
+                .await
+            {
+                Ok(n) => {
+                    tracing::info!(events = n, "event stream ended normally");
+                }
+                Err(sdk::SdkError::Cancelled) => {
+                    tracing::info!("event loop cancelled");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "event stream error, reconnecting in 5s");
+                }
+            }
+
+            tokio::select! {
+                _ = claim_cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        }
+
+        tracing::info!("auto-claim event loop exited");
+    });
 
     // -----------------------------------------------------------------------
     // Chaos sending workers (N concurrent)
@@ -675,7 +703,6 @@ async fn send_btc_with_ledger(
                     new
                 },
             );
-
         }
     }
 }
