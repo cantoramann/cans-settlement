@@ -10,11 +10,12 @@ authors.workspace = true
 description = "Minimal wallet server binary using the Spark SDK"
 
 [dependencies]
-sdk = { path = "../../crates/sdk", features = ["ledger"] }
+sdk = { path = "../../crates/sdk" }
 sdk-core = { workspace = true }
 graphql = { path = "../../crates/graphql" }
 config = { path = "../../crates/config" }
 signer = { path = "../../crates/signer" }
+funding-client = { path = "../../tools/funding-client" }
 bip39 = "2"
 bitcoin = { workspace = true }
 rand_core = { workspace = true }
@@ -23,7 +24,9 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Ledger: provided by sdk's `ledger` feature
+# Ledger store (heed/LMDB backend)
+heed = "0.22"
+serde = { workspace = true }
 serde_json = "1"
 
 [profile.release]

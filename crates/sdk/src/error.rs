@@ -10,7 +10,7 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// Errors from SDK operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdkError {
     /// The SDK has been shut down (cancellation token fired).
     Cancelled,
@@ -62,6 +62,20 @@ pub enum SdkError {
 
     /// A registered hook rejected the operation.
     HookRejected,
+
+    /// The ledger pubkey has not been initialized via `Ledger::init_pubkey`.
+    LedgerNotInitialized,
+
+    /// The ledger store operation failed.
+    LedgerStoreFailed,
+
+    /// The ledger's hash chain is broken.
+    LedgerChainBroken {
+        /// Sequence number where the break was detected.
+        seq: u64,
+        /// Human-readable description of the mismatch.
+        reason: String,
+    },
 }
 
 impl fmt::Display for SdkError {
@@ -84,6 +98,11 @@ impl fmt::Display for SdkError {
             Self::SspSwapFailed => write!(f, "SSP swap failed"),
             Self::SspInvalidResponse => write!(f, "invalid SSP response"),
             Self::HookRejected => write!(f, "hook rejected operation"),
+            Self::LedgerNotInitialized => write!(f, "ledger pubkey not initialized"),
+            Self::LedgerStoreFailed => write!(f, "ledger store operation failed"),
+            Self::LedgerChainBroken { seq, reason } => {
+                write!(f, "ledger hash chain broken at seq {seq}: {reason}")
+            }
         }
     }
 }

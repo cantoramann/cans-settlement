@@ -1,40 +1,26 @@
-//! Hash-chained balance ledger backed by heed (LMDB).
+//! Hash-chained balance ledger.
 //!
-//! Each entry records a state transition and includes the SHA-256 hash of
-//! the previous entry, forming a tamper-evident chain. Entries are keyed by
-//! `[pubkey (33 bytes)][sequence (u64 big-endian)]` for natural per-pubkey
-//! ordering via the B+ tree.
+//! The ledger records per-pubkey state transitions as an append-only,
+//! tamper-evident chain. Each entry includes the SHA-256 hash of the
+//! previous entry's serialized bytes.
+//!
+//! Storage is decoupled via the [`LedgerStore`] trait -- the SDK defines
+//! the chain logic and types; consumers provide the persistence backend
+//! (LMDB, Postgres, in-memory, etc.).
 //!
 //! # Schema
 //!
 //! ```text
-//! Table "entries"
 //! Key:   [pubkey: 33 bytes][seq: 8 bytes big-endian]
-//! Value: LedgerEntry (JSON-serialized, version-prefixed)
-//! ```
-//!
-//! The ledger is designed to be extended: new event variants and balance
-//! fields can be added without breaking existing entries (the `version`
-//! field in each entry handles backward compatibility).
-//!
-//! # Feature Gate
-//!
-//! This module is only available when the `ledger` feature is enabled:
-//!
-//! ```toml
-//! [dependencies]
-//! sdk = { path = "...", features = ["ledger"] }
+//! Value: LedgerEntry (serialization format is backend-defined)
 //! ```
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use bitcoin::hashes::{Hash, sha256};
-use heed::types::Bytes as HeedBytes;
-use heed::{Database, Env, EnvOpenOptions};
-use serde::{Deserialize, Serialize};
+
+use crate::SdkError;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub type PubKey = [u8; 33];
 
 /// A ledger event describing what happened.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum LedgerEvent {
     /// Wallet initialized / genesis entry.
@@ -113,7 +99,7 @@ pub enum LedgerEvent {
 }
 
 /// A single entry in the hash-chained ledger.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LedgerEntry {
     /// Entry format version (for forward-compatible deserialization).
     pub version: u8,
@@ -156,82 +142,81 @@ pub struct BalanceState {
 }
 
 // ---------------------------------------------------------------------------
+// Store trait
+// ---------------------------------------------------------------------------
+
+/// Persistence backend for the hash-chained ledger.
+///
+/// Implementations are responsible for serialization format and storage
+/// engine. The `Ledger` struct handles chain logic, hashing, and caching.
+///
+/// Keys are 41 bytes: `[pubkey: 33][seq: 8 big-endian]`.
+pub trait LedgerStore: Send + Sync {
+    /// Retrieve a single entry by its exact key.
+    fn get(&self, key: &[u8]) -> Result<Option<LedgerEntry>, SdkError>;
+
+    /// Persist an entry at the given key along with its serialized bytes.
+    ///
+    /// The `bytes` are the canonical serialized form whose SHA-256 hash
+    /// becomes the next entry's `prev_hash`. Implementations must store
+    /// these bytes verbatim so that [`get`] and [`list_entries`] can
+    /// reconstruct entries deterministically.
+    fn put(&self, key: &[u8], entry: &LedgerEntry, bytes: &[u8]) -> Result<(), SdkError>;
+
+    /// List all entries for a pubkey, ordered by sequence number.
+    ///
+    /// Returns `(serialized_bytes, entry)` pairs so the caller can
+    /// verify hashes without re-serializing.
+    fn list_entries(&self, pubkey: &PubKey) -> Result<Vec<(Vec<u8>, LedgerEntry)>, SdkError>;
+
+    /// Serialize a [`LedgerEntry`] to bytes.
+    ///
+    /// This must be deterministic: the same entry must always produce
+    /// the same bytes, because those bytes are hashed into the chain.
+    fn serialize(&self, entry: &LedgerEntry) -> Result<Vec<u8>, SdkError>;
+}
+
+// ---------------------------------------------------------------------------
 // Ledger
 // ---------------------------------------------------------------------------
 
-/// Hash-chained balance ledger backed by LMDB (via heed).
+/// Hash-chained balance ledger.
 ///
-/// Thread-safe: uses a `Mutex` around the in-memory state cache and
-/// heed's native transaction isolation for disk access. Multiple
-/// readers can proceed concurrently; writes are serialized.
-pub struct Ledger {
-    env: Env,
-    db: Database<HeedBytes, HeedBytes>,
+/// Thread-safe: uses a `Mutex` around the in-memory state cache.
+/// The backing [`LedgerStore`] is called under the lock so that
+/// append operations are serialized per pubkey.
+pub struct Ledger<S: LedgerStore> {
+    store: S,
     /// Per-pubkey in-memory state cache.
     state: Mutex<HashMap<PubKey, BalanceState>>,
 }
 
-impl Ledger {
-    /// Open or create a ledger at the given directory path.
-    ///
-    /// Creates the directory if it doesn't exist. The LMDB environment
-    /// is configured with a 256 MB map size (grows lazily on disk).
-    pub fn open(path: &Path) -> Result<Arc<Self>, LedgerError> {
-        fs::create_dir_all(path).map_err(|e| LedgerError::Io(e.to_string()))?;
-
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(256 * 1024 * 1024) // 256 MB
-                .max_dbs(1)
-                .open(path)
-                .map_err(|e| LedgerError::Db(e.to_string()))?
-        };
-
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        let db: Database<HeedBytes, HeedBytes> = env
-            .create_database(&mut wtxn, Some("entries"))
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        wtxn.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        let ledger = Arc::new(Self {
-            env,
-            db,
+impl<S: LedgerStore> Ledger<S> {
+    /// Create a new ledger backed by the given store.
+    pub fn new(store: S) -> Self {
+        Self {
+            store,
             state: Mutex::new(HashMap::new()),
-        });
-
-        Ok(ledger)
+        }
     }
 
     /// Initialize a pubkey with a genesis entry if it doesn't exist yet.
     ///
     /// If entries already exist for this pubkey (e.g. after a restart),
     /// the in-memory state is rebuilt by replaying the chain from disk.
-    pub fn init_pubkey(&self, pubkey: &PubKey) -> Result<(), LedgerError> {
+    pub fn init_pubkey(&self, pubkey: &PubKey) -> Result<(), SdkError> {
         let mut state = self.state.lock().unwrap();
         if state.contains_key(pubkey) {
             return Ok(());
         }
 
-        // Check if there are existing entries in the DB for this pubkey.
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        let prefix = entry_key(pubkey, 0);
-        let existing = self
-            .db
-            .get(&rtxn, &prefix)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        if existing.is_some() {
-            // Rebuild state from existing entries.
-            let rebuilt = self.rebuild_state(&rtxn, pubkey)?;
+        // Check if there are existing entries.
+        let genesis_key = entry_key(pubkey, 0);
+        if self.store.get(&genesis_key)?.is_some() {
+            let rebuilt = self.rebuild_state(pubkey)?;
             state.insert(*pubkey, rebuilt);
             return Ok(());
         }
-        drop(rtxn);
 
         // Write genesis entry.
         let genesis = LedgerEntry {
@@ -246,18 +231,9 @@ impl Ledger {
             prev_hash: [0u8; 32],
         };
 
-        let bytes =
-            serde_json::to_vec(&genesis).map_err(|e| LedgerError::Serialize(e.to_string()))?;
+        let bytes = self.store.serialize(&genesis)?;
         let key = entry_key(pubkey, 0);
-
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        self.db
-            .put(&mut wtxn, &key, &bytes)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        wtxn.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
+        self.store.put(&key, &genesis, &bytes)?;
 
         let hash = hash256(&bytes);
         state.insert(
@@ -276,17 +252,15 @@ impl Ledger {
     ///
     /// The `patch` closure receives the current balance state and must
     /// return the new state. The event and new state are written
-    /// atomically to LMDB in a single transaction.
+    /// atomically to the store.
     pub fn append(
         &self,
         pubkey: &PubKey,
         event: LedgerEvent,
         patch: impl FnOnce(&BalanceState) -> BalanceState,
-    ) -> Result<LedgerEntry, LedgerError> {
+    ) -> Result<LedgerEntry, SdkError> {
         let mut states = self.state.lock().unwrap();
-        let current = states
-            .get(pubkey)
-            .ok_or(LedgerError::PubKeyNotInitialized)?;
+        let current = states.get(pubkey).ok_or(SdkError::LedgerNotInitialized)?;
 
         let new_state = patch(current);
 
@@ -302,18 +276,9 @@ impl Ledger {
             prev_hash: current.prev_hash,
         };
 
-        let bytes =
-            serde_json::to_vec(&entry).map_err(|e| LedgerError::Serialize(e.to_string()))?;
+        let bytes = self.store.serialize(&entry)?;
         let key = entry_key(pubkey, entry.seq);
-
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        self.db
-            .put(&mut wtxn, &key, &bytes)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        wtxn.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
+        self.store.put(&key, &entry, &bytes)?;
 
         let hash = hash256(&bytes);
         let mut updated = new_state;
@@ -329,55 +294,40 @@ impl Ledger {
         self.state.lock().unwrap().get(pubkey).cloned()
     }
 
-    /// Read all entries for a pubkey from the database.
-    pub fn read_all(&self, pubkey: &PubKey) -> Result<Vec<LedgerEntry>, LedgerError> {
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-        let prefix = pubkey.as_slice();
-
-        let mut entries = Vec::new();
-        let iter = self
-            .db
-            .prefix_iter(&rtxn, prefix)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        for result in iter {
-            let (_key, value) = result.map_err(|e| LedgerError::Db(e.to_string()))?;
-            let entry: LedgerEntry =
-                serde_json::from_slice(value).map_err(|e| LedgerError::Serialize(e.to_string()))?;
-            entries.push(entry);
-        }
-
-        Ok(entries)
+    /// Read all entries for a pubkey from the store.
+    pub fn read_all(&self, pubkey: &PubKey) -> Result<Vec<LedgerEntry>, SdkError> {
+        Ok(self
+            .store
+            .list_entries(pubkey)?
+            .into_iter()
+            .map(|(_bytes, entry)| entry)
+            .collect())
     }
 
     /// Verify the hash chain for a pubkey.
     ///
     /// Returns the number of entries verified, or an error at the first
     /// broken link.
-    pub fn verify_chain(&self, pubkey: &PubKey) -> Result<usize, LedgerError> {
-        let entries = self.read_all(pubkey)?;
-        if entries.is_empty() {
+    pub fn verify_chain(&self, pubkey: &PubKey) -> Result<usize, SdkError> {
+        let pairs = self.store.list_entries(pubkey)?;
+        if pairs.is_empty() {
             return Ok(0);
         }
 
         // Genesis must have all-zero prev_hash.
-        if entries[0].prev_hash != [0u8; 32] {
-            return Err(LedgerError::ChainBroken {
+        let (ref genesis_bytes, ref genesis) = pairs[0];
+        if genesis.prev_hash != [0u8; 32] {
+            return Err(SdkError::LedgerChainBroken {
                 seq: 0,
                 reason: "genesis entry has non-zero prev_hash".into(),
             });
         }
 
-        let genesis_bytes =
-            serde_json::to_vec(&entries[0]).map_err(|e| LedgerError::Serialize(e.to_string()))?;
-        let mut prev_hash = hash256(&genesis_bytes);
+        let mut prev_hash = hash256(genesis_bytes);
 
-        for entry in &entries[1..] {
+        for (bytes, entry) in &pairs[1..] {
             if entry.prev_hash != prev_hash {
-                return Err(LedgerError::ChainBroken {
+                return Err(SdkError::LedgerChainBroken {
                     seq: entry.seq,
                     reason: format!(
                         "prev_hash mismatch: expected {}, got {}",
@@ -386,48 +336,29 @@ impl Ledger {
                     ),
                 });
             }
-            let bytes =
-                serde_json::to_vec(entry).map_err(|e| LedgerError::Serialize(e.to_string()))?;
-            prev_hash = hash256(&bytes);
+            prev_hash = hash256(bytes);
         }
 
-        Ok(entries.len())
+        Ok(pairs.len())
     }
 
-    /// Dump all entries for a pubkey to a JSON file.
-    pub fn dump_to_file(&self, pubkey: &PubKey, path: &Path) -> Result<usize, LedgerError> {
-        let entries = self.read_all(pubkey)?;
-        let count = entries.len();
-        let json = serde_json::to_string_pretty(&entries)
-            .map_err(|e| LedgerError::Serialize(e.to_string()))?;
-        fs::write(path, json).map_err(|e| LedgerError::Io(e.to_string()))?;
-        Ok(count)
+    /// Access the underlying store (e.g. for dump operations).
+    pub fn store(&self) -> &S {
+        &self.store
     }
 
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
 
-    fn rebuild_state(
-        &self,
-        rtxn: &heed::RoTxn<'_>,
-        pubkey: &PubKey,
-    ) -> Result<BalanceState, LedgerError> {
-        let prefix = pubkey.as_slice();
+    fn rebuild_state(&self, pubkey: &PubKey) -> Result<BalanceState, SdkError> {
+        let pairs = self.store.list_entries(pubkey)?;
 
-        let mut last_entry: Option<LedgerEntry> = None;
+        let mut last_entry: Option<&LedgerEntry> = None;
         let mut last_hash = [0u8; 32];
 
-        let iter = self
-            .db
-            .prefix_iter(rtxn, prefix)
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
-
-        for result in iter {
-            let (_key, value) = result.map_err(|e| LedgerError::Db(e.to_string()))?;
-            last_hash = hash256(value);
-            let entry: LedgerEntry =
-                serde_json::from_slice(value).map_err(|e| LedgerError::Serialize(e.to_string()))?;
+        for (bytes, entry) in &pairs {
+            last_hash = hash256(bytes);
             last_entry = Some(entry);
         }
 
@@ -436,8 +367,8 @@ impl Ledger {
                 btc_balance_sats: entry.btc_balance_sats,
                 btc_in_transit_sats: entry.btc_in_transit_sats,
                 btc_reserved_sats: entry.btc_reserved_sats,
-                token_balances: entry.token_balances,
-                token_in_transit: entry.token_in_transit,
+                token_balances: entry.token_balances.clone(),
+                token_in_transit: entry.token_in_transit.clone(),
                 next_seq: entry.seq + 1,
                 prev_hash: last_hash,
             }),
@@ -451,7 +382,7 @@ impl Ledger {
 // ---------------------------------------------------------------------------
 
 /// Build a 41-byte key: `[pubkey: 33][seq: 8 big-endian]`.
-fn entry_key(pubkey: &PubKey, seq: u64) -> Vec<u8> {
+pub fn entry_key(pubkey: &PubKey, seq: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(41);
     key.extend_from_slice(pubkey);
     key.extend_from_slice(&seq.to_be_bytes());
@@ -470,43 +401,3 @@ fn hex_short(bytes: &[u8; 32]) -> String {
         .collect::<String>()
         + "..."
 }
-
-// ---------------------------------------------------------------------------
-// Error
-// ---------------------------------------------------------------------------
-
-/// Errors from the hash-chained ledger.
-#[derive(Debug)]
-pub enum LedgerError {
-    /// LMDB / heed database error.
-    Db(String),
-    /// Filesystem I/O error.
-    Io(String),
-    /// JSON serialization/deserialization error.
-    Serialize(String),
-    /// The pubkey was not initialized via [`Ledger::init_pubkey`].
-    PubKeyNotInitialized,
-    /// The hash chain is broken at the given sequence number.
-    ChainBroken {
-        /// Sequence number where the break was detected.
-        seq: u64,
-        /// Human-readable description of the mismatch.
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Db(e) => write!(f, "ledger db error: {e}"),
-            Self::Io(e) => write!(f, "ledger io error: {e}"),
-            Self::Serialize(e) => write!(f, "ledger serialization error: {e}"),
-            Self::PubKeyNotInitialized => write!(f, "pubkey not initialized in ledger"),
-            Self::ChainBroken { seq, reason } => {
-                write!(f, "hash chain broken at seq {seq}: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LedgerError {}

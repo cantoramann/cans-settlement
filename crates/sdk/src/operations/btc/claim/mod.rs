@@ -187,7 +187,7 @@ where
             let t = Instant::now();
             if let Err(e) = self.inner.hooks.run_pre_claim(transfer).await {
                 warn!(op_id = %op_id, transfer_id = %tid, "pre-claim hook rejected");
-                tracker.step_failed(OperationStep::PreClaimHook, e, t.elapsed());
+                tracker.step_failed(OperationStep::PreClaimHook, e.clone(), t.elapsed());
                 last_error = Some(e);
                 failed_transfers += 1;
                 continue;
@@ -238,7 +238,7 @@ where
                         "claim failed after {} attempt(s)",
                         attempt + 1
                     );
-                    tracker.step_failed(step, e, t.elapsed());
+                    tracker.step_failed(step, e.clone(), t.elapsed());
                     last_error = Some(e);
                     failed_transfers += 1;
                 }
